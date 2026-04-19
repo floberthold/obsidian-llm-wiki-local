@@ -90,6 +90,70 @@ ollama pull qwen2.5:14b     # heavy model — article writing (optional, 7B+ rec
 
 > **Minimal setup:** pull only `gemma4:e4b` and set both `fast` and `heavy` to it in the wizard.
 
+### 2b. CMD parallel
+
+Use this in cmd:
+
+set OLLAMA_NUM_PARALLEL=8
+
+    ollama serve
+
+Or one line:
+
+    set OLLAMA_NUM_PARALLEL=8 && ollama serve
+
+Then in a second cmd window (for the pipeline):
+
+    set OLLAMA_NUM_PARALLEL=8 && setx OLLAMA_NUM_THREADS 12 && python -m obsidian_llm_wiki.cli run
+
+Or: 
+
+    set OLLAMA_NUM_PARALLEL=8 && setx OLLAMA_NUM_THREADS 12 && olw run
+
+### 2c. Windows startup guide (parallel CPU setup)
+
+Use this once to configure Ollama for higher CPU throughput on Windows.
+
+1. Set persistent environment variables in `cmd`:
+
+```cmd
+setx OLLAMA_NUM_PARALLEL 8
+setx OLLAMA_NUM_THREADS 12
+```
+
+2. Restart Ollama (required after `setx`):
+
+```cmd
+taskkill /IM "ollama app.exe" /F
+taskkill /IM ollama.exe /F
+start "" "C:\Users\%USERNAME%\AppData\Local\Programs\Ollama\ollama app.exe"
+```
+
+3. Open a new `cmd` window and verify values:
+
+```cmd
+echo %OLLAMA_NUM_PARALLEL%
+echo %OLLAMA_NUM_THREADS%
+```
+
+4. In your vault `wiki.toml`, reduce fast-tier context for better parallel scaling:
+
+```toml
+[ollama]
+fast_ctx = 4096
+```
+
+5. Run the pipeline:
+
+```cmd
+olw run
+```
+
+Notes:
+- `setx` updates future processes only; your current terminal keeps old values.
+- If you see `bind: Only one usage of each socket address`, Ollama is already running. Do not start a second `ollama serve`.
+- Start with `OLLAMA_NUM_PARALLEL=8`; if the system becomes unstable, lower to `6`.
+
 ### 3. Run the setup wizard
 
 ```bash
