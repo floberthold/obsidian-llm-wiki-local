@@ -17,6 +17,7 @@ Commands:
 from __future__ import annotations
 
 import sys
+import time
 from pathlib import Path
 
 import click
@@ -75,6 +76,14 @@ def _load_deps(config):
         sys.exit(1)
     db = _load_db(config)
     return client, db
+
+
+def _format_eta(seconds: float | None) -> str:
+    if seconds is None:
+        return "--:--"
+    whole = max(0, int(round(seconds)))
+    mins, secs = divmod(whole, 60)
+    return f"{mins:02d}:{secs:02d}"
 
 
 # ── CLI root ──────────────────────────────────────────────────────────────────
@@ -671,6 +680,8 @@ def ingest(vault_str, ingest_all, force, paths):
         return
 
     skipped = ingested = failed = 0
+    durations: list[float] = []
+    total_paths = len(target_paths)
 
     with Progress(
         SpinnerColumn(),
@@ -682,8 +693,13 @@ def ingest(vault_str, ingest_all, force, paths):
     ) as progress:
         task = progress.add_task("Ingesting...", total=len(target_paths))
 
-        for path in target_paths:
-            progress.update(task, description=f"[dim]{path.name}[/dim]")
+        for idx, path in enumerate(target_paths, 1):
+            step_t0 = time.monotonic()
+            progress.update(
+                task,
+                description=f"[dim]{path.name} | {((idx - 1) / total_paths) * 100:5.1f}%"
+                f" | ETA {_format_eta(None)}[/dim]",
+            )
             from .pipeline.ingest import ingest_note as _ingest_note
 
             result = _ingest_note(
@@ -703,6 +719,15 @@ def ingest(vault_str, ingest_all, force, paths):
                     skipped += 1
             else:
                 ingested += 1
+            durations.append(time.monotonic() - step_t0)
+            eta = None
+            if idx < total_paths and durations:
+                eta = (sum(durations) / len(durations)) * (total_paths - idx)
+            progress.update(
+                task,
+                description=f"[dim]{path.name} | {(idx / total_paths) * 100:5.1f}%"
+                f" | ETA {_format_eta(eta)}[/dim]",
+            )
             progress.advance(task)
 
     console.print(
@@ -792,13 +817,22 @@ def compile(vault_str, dry_run, auto_approve, force, legacy, retry_failed):
             )
         else:
             task = progress.add_task("Compiling concepts...", total=1)
+            compile_started = time.monotonic()
+            compile_state = {"total": 1}
 
             def _on_progress(idx: int, total: int, name: str) -> None:
+                completed = max(idx - 1, 0)
+                compile_state["total"] = max(total, 1)
+                eta = None
+                if completed > 0 and total > completed:
+                    elapsed = time.monotonic() - compile_started
+                    eta = (elapsed / completed) * (total - completed)
                 progress.update(
                     task,
                     total=total,
-                    completed=idx - 1,
-                    description=f"[dim]{name}[/dim]",
+                    completed=completed,
+                    description=f"[dim]{name} | {(completed / total) * 100:5.1f}%"
+                    f" | ETA {_format_eta(eta)}[/dim]",
                 )
 
             draft_paths, failed, _ = compile_concepts(
@@ -809,7 +843,13 @@ def compile(vault_str, dry_run, auto_approve, force, legacy, retry_failed):
                 dry_run=dry_run,
                 on_progress=_on_progress,
             )
-            progress.update(task, completed=progress.tasks[task].total or 1)
+            final_total = compile_state["total"]
+            progress.update(
+                task,
+                total=final_total,
+                completed=final_total,
+                description=f"[dim]Done | 100.0% | ETA {_format_eta(0)}[/dim]",
+            )
 
     if dry_run:
         return
@@ -1330,12 +1370,51 @@ def run(vault_str, auto_approve, fix, max_rounds, dry_run):
             err_console.print("Pipeline already running — lock held. Check `olw status`.")
             sys.exit(1)
         orchestrator = PipelineOrchestrator(config, client, db)
-        report = orchestrator.run(
-            auto_approve=auto_approve,
-            fix=fix,
-            max_rounds=max_rounds,
-            dry_run=dry_run,
-        )
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TextColumn("{task.completed}/{task.total}"),
+            TimeElapsedColumn(),
+            console=console,
+        ) as progress:
+            task = progress.add_task("Running pipeline...", total=1)
+
+            def _on_progress(
+                stage: str,
+                completed: int,
+                total: int,
+                eta_seconds: float | None,
+                detail: str,
+            ) -> None:
+                stage_label = {
+                    "ingest": "Ingest",
+                    "compile_r1": "Compile r1",
+                    "compile_r2": "Compile r2",
+                }.get(stage, stage)
+                safe_total = total if total > 0 else 1
+                pct = (completed / total) * 100 if total > 0 else 100.0
+                progress.update(
+                    task,
+                    total=safe_total,
+                    completed=min(completed, safe_total),
+                    description=f"[dim]{stage_label}: {detail} | {pct:5.1f}%"
+                    f" | ETA {_format_eta(eta_seconds)}[/dim]",
+                )
+
+            report = orchestrator.run(
+                auto_approve=auto_approve,
+                fix=fix,
+                max_rounds=max_rounds,
+                dry_run=dry_run,
+                on_progress=_on_progress,
+            )
+            progress.update(
+                task,
+                total=1,
+                completed=1,
+                description=f"[dim]Done | 100.0% | ETA {_format_eta(0)}[/dim]",
+            )
 
     table = Table(title="Pipeline Report", show_header=True)
     table.add_column("Step")

@@ -16,6 +16,7 @@ import time
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
+from typing import Callable
 
 from ..config import Config
 from ..protocols import LLMClientProtocol
@@ -73,6 +74,7 @@ class PipelineOrchestrator:
         fix: bool = False,
         max_rounds: int = 2,
         dry_run: bool = False,
+        on_progress: Callable[[str, int, int, float | None, str], None] | None = None,
     ) -> PipelineReport:
         """
         Run full pipeline: ingest → compile → lint → [stubs] → [approve].
@@ -105,7 +107,10 @@ class PipelineOrchestrator:
             md_paths = [str(p) for p in collect_ingest_paths(config)]
 
         log.info("── Ingest (%d note(s)) ──────────────────────────────────", len(md_paths))
-        for raw_path_str in md_paths:
+        ingest_durations: list[float] = []
+        ingest_total = len(md_paths)
+        for idx, raw_path_str in enumerate(md_paths, 1):
+            step_t0 = time.monotonic()
             p = Path(raw_path_str)
             if not p.exists():
                 continue
@@ -113,6 +118,11 @@ class PipelineOrchestrator:
                 log.info("[dry-run] would ingest: %s", p.name)
                 ingested_paths.append(raw_path_str)
                 report.ingested += 1
+                if on_progress:
+                    eta = None
+                    if idx < ingest_total:
+                        eta = float(ingest_total - idx)
+                    on_progress("ingest", idx, ingest_total, eta, p.name)
                 continue
             try:
                 result = ingest_note(path=p, config=config, client=client, db=db)
@@ -121,6 +131,14 @@ class PipelineOrchestrator:
                     ingested_paths.append(raw_path_str)
             except Exception as e:
                 log.error("Ingest failed for %s: %s", p.name, e)
+            finally:
+                ingest_durations.append(time.monotonic() - step_t0)
+                if on_progress and ingest_total:
+                    eta = None
+                    if idx < ingest_total:
+                        avg = sum(ingest_durations) / len(ingest_durations)
+                        eta = avg * (ingest_total - idx)
+                    on_progress("ingest", idx, ingest_total, eta, p.name)
 
         report.timings["ingest"] = time.monotonic() - t0
 
@@ -144,9 +162,21 @@ class PipelineOrchestrator:
         n_concepts = len(priority_concepts) if priority_concepts else "all"
         log.info("── Compile round 1 (%s concept(s)) ─────────────────────────", n_concepts)
         t1 = time.monotonic()
+
+        def _on_round1_progress(completed: int, total: int, name: str, eta: float | None) -> None:
+            if on_progress:
+                on_progress("compile_r1", completed, total, eta, name)
+
         draft_paths, round1_failed, r1_timings = _run_compile(
-            config, client, db, concepts=priority_concepts, dry_run=dry_run
+            config,
+            client,
+            db,
+            concepts=priority_concepts,
+            dry_run=dry_run,
+            on_progress=_on_round1_progress,
         )
+        if on_progress and priority_concepts:
+            on_progress("compile_r1", len(priority_concepts), len(priority_concepts), 0.0, "done")
         report.timings["compile_r1"] = time.monotonic() - t1
         report.compiled += len(draft_paths)
         report.failed.extend(round1_failed)
@@ -170,9 +200,27 @@ class PipelineOrchestrator:
             log.info("── Compile round 2 (%d retries) ────────────────────────────", len(transient))
             transient_concepts = [f.concept for f in transient]
             t2 = time.monotonic()
+
+            def _on_round2_progress(completed: int, total: int, name: str, eta: float | None) -> None:
+                if on_progress:
+                    on_progress("compile_r2", completed, total, eta, name)
+
             r2_drafts, r2_failed, r2_timings = _run_compile(
-                config, client, db, concepts=transient_concepts, dry_run=dry_run
+                config,
+                client,
+                db,
+                concepts=transient_concepts,
+                dry_run=dry_run,
+                on_progress=_on_round2_progress,
             )
+            if on_progress and transient_concepts:
+                on_progress(
+                    "compile_r2",
+                    len(transient_concepts),
+                    len(transient_concepts),
+                    0.0,
+                    "done",
+                )
             report.timings["compile_r2"] = time.monotonic() - t2
             report.compiled += len(r2_drafts)
             draft_paths = draft_paths + r2_drafts
@@ -208,18 +256,32 @@ def _run_compile(
     db: StateDB,
     concepts: list[str] | None,
     dry_run: bool,
+    on_progress: Callable[[int, int, str, float | None], None] | None = None,
 ) -> tuple[list[Path], list[FailureRecord], dict[str, float]]:
     """Run compile_concepts and classify failures by reason."""
     from ..openai_compat_client import LLMBadRequestError, LLMError
     from ..pipeline.compile import compile_concepts
 
     try:
+        compile_t0 = time.monotonic()
+
+        def _on_compile_progress(idx: int, total: int, name: str) -> None:
+            if not on_progress:
+                return
+            completed = max(idx - 1, 0)
+            eta = None
+            if completed > 0 and total > completed:
+                elapsed = time.monotonic() - compile_t0
+                eta = (elapsed / completed) * (total - completed)
+            on_progress(completed, total, name, eta)
+
         draft_paths, failed_names, concept_timings = compile_concepts(
             config=config,
             client=client,
             db=db,
             dry_run=dry_run,
             concepts=concepts,
+            on_progress=_on_compile_progress,
         )
     except LLMBadRequestError as e:
         # Bad request (HTTP 400) — non-retryable; mark all as UNKNOWN not TRANSIENT

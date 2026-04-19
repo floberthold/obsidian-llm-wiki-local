@@ -174,6 +174,24 @@ def test_orchestrator_run_timings_populated(config, db):
     assert "ingest" in report.timings
 
 
+def test_orchestrator_run_emits_progress_callbacks(config, db):
+    raw_file = config.vault / "raw" / "note.md"
+    raw_file.write_text("---\ntitle: Note\n---\nContent.")
+    db.upsert_raw(RawNoteRecord(path="raw/note.md", content_hash="h1", status="ingested"))
+    db.upsert_concepts("raw/note.md", ["Alpha"])
+
+    updates = []
+
+    with patch("obsidian_llm_wiki.pipeline.ingest.ingest_note", return_value=object()):
+        with patch("obsidian_llm_wiki.pipeline.orchestrator._run_compile") as mock_compile:
+            mock_compile.return_value = ([], [], {})
+            orch = PipelineOrchestrator(config, make_mock_client(), db)
+            orch.run(paths=[str(raw_file)], on_progress=lambda *args: updates.append(args))
+
+    assert any(u[0] == "ingest" for u in updates)
+    assert any(u[0] == "compile_r1" for u in updates)
+
+
 def test_orchestrator_run_rounds_default_one(config, db):
     """No transient failures → only one compile round."""
     with patch("obsidian_llm_wiki.pipeline.orchestrator._run_compile") as mock_compile:

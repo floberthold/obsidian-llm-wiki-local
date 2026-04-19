@@ -223,6 +223,51 @@ _STOPWORDS = frozenset(
     }
 )
 
+_CONCEPT_JUNK_RE = re.compile(
+    r"^(?:page|p\.?|figure|fig|section|sec|chapter|ch|slide)\s*[-:#.]?\s*\d+(?:\.\d+)*\b",
+    re.IGNORECASE,
+)
+
+_SINGULAR_EXCEPTIONS = frozenset({"analysis", "news", "series", "species", "status"})
+
+
+def _is_valid_concept_name(name: str) -> bool:
+    """Drop obviously low-information concepts like page/figure labels."""
+    stripped = name.strip()
+    if not stripped:
+        return False
+    if _CONCEPT_JUNK_RE.match(stripped):
+        return False
+    if re.fullmatch(r"\d+(?:\.\d+)*", stripped):
+        return False
+    return True
+
+
+def _singularize_token(token: str) -> str:
+    """Apply lightweight plural reduction for simple concept deduping."""
+    lower = token.lower()
+    if len(lower) <= 3 or lower in _SINGULAR_EXCEPTIONS:
+        return token
+    if lower.endswith("ies") and len(lower) > 4:
+        return token[:-3] + "y"
+    if lower.endswith("ses") and len(lower) > 4:
+        return token[:-2]
+    if lower.endswith("s") and not lower.endswith(("ss", "us", "is")):
+        return token[:-1]
+    return token
+
+
+def _singularize_phrase(name: str) -> str:
+    words = name.split()
+    if not words:
+        return name
+    words[-1] = _singularize_token(words[-1])
+    return " ".join(words)
+
+
+def _concept_singular_key(name: str) -> str:
+    return re.sub(r"\s+", " ", _singularize_phrase(name).strip()).lower()
+
 
 def _validate_aliases(canonical: str, raw_aliases: list[str]) -> list[str]:
     """Filter LLM-produced aliases: remove too-short, stopwords, self-matches, duplicates."""
@@ -248,17 +293,23 @@ def _normalize_concepts(raw_concepts: list[Concept], db: StateDB) -> list[tuple[
 
     Returns (canonical_name, validated_aliases) pairs.
     """
-    existing = {n.lower(): n for n in db.list_all_concept_names()}
+    existing_names = db.list_all_concept_names()
+    existing = {n.lower(): n for n in existing_names}
+    existing_singular = {_concept_singular_key(n): n for n in existing_names}
     seen: set[str] = set()
     result: list[tuple[str, list[str]]] = []
     for concept in raw_concepts:
         name = concept.name.strip()
-        if not name:
+        if not _is_valid_concept_name(name):
             continue
-        canonical = existing.get(name.lower(), name)
-        if canonical in seen:
+        canonical = existing.get(name.lower()) or existing_singular.get(_concept_singular_key(name))
+        if canonical is None:
+            canonical = name
+
+        canonical_key = _concept_singular_key(canonical)
+        if canonical_key in seen:
             continue
-        seen.add(canonical)
+        seen.add(canonical_key)
         aliases = _validate_aliases(canonical, concept.aliases)
         result.append((canonical, aliases))
     return result
@@ -455,7 +506,7 @@ def _create_source_summary_page(
         "",
         "## Source Info",
         f"- **Quality:** {result.quality}",
-        f"- **Raw file:** {rel_raw}",
+        f"- **Raw file:** [[{rel_raw}]]",
         f"- **Ingested:** {now}",
     ]
     if source_url:

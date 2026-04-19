@@ -193,6 +193,26 @@ def test_normalize_strips_empty(vault, config, db):
     assert "Neural Networks" in names
 
 
+def test_normalize_merges_plural_variants(vault, config, db):
+    result = _normalize_concepts(_make_concepts(["Action Flow", "Action Flows"]), db)
+    assert len(result) == 1
+    assert result[0][0] == "Action Flow"
+
+
+def test_normalize_reuses_existing_singular_canonical(vault, config, db):
+    db.upsert_concepts("raw/a.md", ["Action Flow"])
+    result = _normalize_concepts(_make_concepts(["Action Flows"]), db)
+    assert [name for name, _ in result] == ["Action Flow"]
+
+
+def test_normalize_filters_obvious_page_labels(vault, config, db):
+    result = _normalize_concepts(_make_concepts(["page 35", "Figure 2", "Process Mining"]), db)
+    names = [name for name, _ in result]
+    assert "page 35" not in [n.lower() for n in names]
+    assert "Figure 2" not in names
+    assert "Process Mining" in names
+
+
 # ── ingest_note ───────────────────────────────────────────────────────────────
 
 
@@ -378,6 +398,16 @@ def test_source_page_roundtrip(vault, config, db):
     assert isinstance(meta["aliases"], list)
     assert "## Summary" in body
     assert "## Concepts" in body
+
+
+def test_source_page_raw_file_is_clickable_wikilink(vault, config, db):
+    path = _write_raw(vault, "source-link.md", "# Link\n\nSource link test.")
+    client = _make_client(_analysis_json(concepts=["Linking"]))
+    ingest_note(path, config, client, db)
+    sources = list((vault / "wiki" / "sources").glob("*.md"))
+    assert sources
+    source_text = sources[0].read_text(encoding="utf-8")
+    assert "- **Raw file:** [[raw/source-link.md]]" in source_text
 
 
 def test_source_page_media_section(vault, config, db):
