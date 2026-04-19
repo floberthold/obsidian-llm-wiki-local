@@ -230,6 +230,35 @@ Leave `language` unset (the default) to let auto-detection drive it per concept.
 
 ---
 
+## Performance telemetry
+
+`olw` now records timing telemetry for both:
+
+1. Top-level pipeline functions (`ingest_note`, `compile_concepts`, `run_query`, `approve_drafts`)
+2. Per-request LLM calls (`request_structured`, including retries and parse tier)
+
+Telemetry is enabled by default and written as append-only JSONL:
+
+```toml
+[pipeline]
+telemetry_enabled = true
+telemetry_jsonl_path = ".olw/metrics.jsonl"
+```
+
+Each JSON line includes machine-readable fields such as:
+
+- `event_type`
+- `function_name`
+- `stage`
+- `model`
+- `success`
+- `duration_ms`
+- `retry_attempt`, `max_retries`, `parse_tier` (for LLM request events)
+
+This makes it easy to compare fast vs heavy model latency by function over time and decide whether to swap model assignments for better throughput.
+
+---
+
 ## Rejection feedback loop
 
 The core v0.2 feature. When you reject a draft:

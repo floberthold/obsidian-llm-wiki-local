@@ -86,7 +86,7 @@ class PipelineOrchestrator:
         from ..git_ops import git_commit
         from ..indexer import append_log, generate_index
         from ..pipeline.compile import approve_drafts
-        from ..pipeline.ingest import ingest_note
+        from ..pipeline.ingest import collect_ingest_paths, ingest_note
         from ..pipeline.lint import run_lint
         from ..pipeline.maintain import create_stubs
 
@@ -100,11 +100,9 @@ class PipelineOrchestrator:
         ingested_paths: list[str] = []
 
         if paths is not None:
-            md_paths = [p for p in paths if p.endswith(".md")]
+            md_paths = [str(p) for p in collect_ingest_paths(config, [Path(p) for p in paths])]
         else:
-            md_paths = (
-                [str(p) for p in config.raw_dir.rglob("*.md")] if config.raw_dir.exists() else []
-            )
+            md_paths = [str(p) for p in collect_ingest_paths(config)]
 
         log.info("── Ingest (%d note(s)) ──────────────────────────────────", len(md_paths))
         for raw_path_str in md_paths:
@@ -138,9 +136,9 @@ class PipelineOrchestrator:
             relative_ingested = []
             for p_str in ingested_paths:
                 try:
-                    relative_ingested.append(str(Path(p_str).relative_to(config.vault)))
+                    relative_ingested.append(Path(p_str).relative_to(config.vault).as_posix())
                 except ValueError:
-                    relative_ingested.append(p_str)  # already relative
+                    relative_ingested.append(Path(p_str).as_posix())  # already relative
             priority_concepts = db.get_concepts_for_sources(relative_ingested) or None
 
         n_concepts = len(priority_concepts) if priority_concepts else "all"

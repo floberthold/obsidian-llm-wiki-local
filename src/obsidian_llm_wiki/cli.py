@@ -656,15 +656,12 @@ def ingest(vault_str, ingest_all, force, paths):
 
     config = _load_config(vault_str)
     client, db = _load_deps(config)
+    from .pipeline.ingest import collect_ingest_paths as _collect_ingest_paths
 
     if ingest_all:
-        target_paths = [
-            p
-            for p in config.raw_dir.rglob("*.md")
-            if "processed" not in p.parts and not p.name.startswith(".")
-        ]
+        target_paths = _collect_ingest_paths(config)
     elif paths:
-        target_paths = [Path(p).resolve() for p in paths]
+        target_paths = _collect_ingest_paths(config, [Path(p).resolve() for p in paths])
     else:
         click.echo("Specify --all or provide file paths.", err=True)
         sys.exit(1)

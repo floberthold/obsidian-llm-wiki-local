@@ -11,6 +11,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from obsidian_llm_wiki.config import Config
 from obsidian_llm_wiki.models import AnalysisResult, CompilePlan, SingleArticle
 from obsidian_llm_wiki.ollama_client import OllamaClient
 from obsidian_llm_wiki.structured_output import StructuredOutputError, request_structured
@@ -221,3 +222,31 @@ def test_single_article_missing_required_field():
             model="qwen2.5:14b",
             max_retries=0,
         )
+
+
+def test_request_structured_writes_telemetry_jsonl(tmp_path):
+    raw = json.dumps({"title": "T", "content": "body", "tags": ["t"]})
+    c = _client(raw)
+    cfg = Config(vault=tmp_path)
+
+    result = request_structured(
+        client=c,
+        prompt="write",
+        model_class=SingleArticle,
+        model="qwen2.5:14b",
+        telemetry_config=cfg,
+        telemetry_stage="unit_test_stage",
+    )
+
+    assert result.title == "T"
+    metrics_path = tmp_path / ".olw" / "metrics.jsonl"
+    assert metrics_path.exists()
+
+    lines = metrics_path.read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) >= 1
+    payload = json.loads(lines[-1])
+    assert payload["event_type"] == "llm_request"
+    assert payload["function_name"] == "request_structured"
+    assert payload["stage"] == "unit_test_stage"
+    assert payload["model"] == "qwen2.5:14b"
+    assert payload["success"] is True

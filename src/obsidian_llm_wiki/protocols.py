@@ -21,6 +21,8 @@ class LLMClientProtocol(Protocol):
         format: str | None = ...,
         num_ctx: int = ...,
         num_predict: int = ...,
+        telemetry_config=None,
+        telemetry_stage: str = ...,
     ) -> str: ...
 
     def embed_batch(self, texts: list[str], model: str = ...) -> list[list[float]]: ...

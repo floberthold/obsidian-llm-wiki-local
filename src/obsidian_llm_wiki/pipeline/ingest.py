@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -17,6 +18,7 @@ from ..models import AnalysisResult, Concept, RawNoteRecord
 from ..protocols import LLMClientProtocol
 from ..state import StateDB
 from ..structured_output import request_structured
+from ..telemetry import emit_event
 from ..vault import (
     chunk_text,
     generate_aliases,
@@ -131,6 +133,8 @@ def _analyze_body(
             model=config.models.fast,
             system=_SYSTEM,
             num_ctx=config.effective_provider.fast_ctx,
+            telemetry_config=config,
+            telemetry_stage="ingest_analysis",
         )
 
     # Split into chunks — no overlap needed for concept extraction
@@ -144,8 +148,6 @@ def _analyze_body(
     )
 
     def _analyze_chunk(chunk: str, idx: int) -> AnalysisResult:
-        import time
-
         label = f"[part {idx + 1}/{len(chunks)}]"
         log.info("Analyzing %s %s …", path_name or "note", label)
         t0 = time.monotonic()
@@ -157,6 +159,8 @@ def _analyze_body(
             model=config.models.fast,
             system=_SYSTEM,
             num_ctx=config.effective_provider.fast_ctx,
+            telemetry_config=config,
+            telemetry_stage="ingest_analysis_chunk",
         )
         log.info("Analyzed %s %s (%.1fs)", path_name or "note", label, time.monotonic() - t0)
         return result
@@ -280,6 +284,103 @@ def _preprocess_web_clip(content: str) -> str:
     return "\n".join(cleaned)
 
 
+def _is_ingest_candidate(path: Path) -> bool:
+    return path.is_file() and "processed" not in path.parts and not path.name.startswith(".")
+
+
+def _page_output_dir(pdf_path: Path) -> Path:
+    return pdf_path.parent / sanitize_filename(pdf_path.stem)
+
+
+def convert_pdf_to_markdown(pdf_path: Path, overwrite: bool = False) -> list[Path]:
+    """Convert a PDF into one markdown file per page inside a sibling folder."""
+    try:
+        from pypdf import PdfReader
+    except Exception as e:
+        log.warning("PDF conversion unavailable for %s: %s", pdf_path.name, e)
+        return []
+
+    output_dir = _page_output_dir(pdf_path)
+    existing_pages = sorted(output_dir.glob("page-*.md")) if output_dir.exists() else []
+    if existing_pages and not overwrite:
+        return existing_pages
+
+    try:
+        reader = PdfReader(str(pdf_path))
+    except Exception as e:
+        log.warning("Failed to read PDF %s: %s", pdf_path.name, e)
+        return []
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    if overwrite:
+        for existing in output_dir.glob("page-*.md"):
+            existing.unlink(missing_ok=True)
+
+    rel_pdf = pdf_path.as_posix()
+    written_paths: list[Path] = []
+    for page_number, page in enumerate(reader.pages, start=1):
+        text = (page.extract_text() or "").strip()
+        if not text:
+            text = "(No extractable text found on this page. The PDF may be image-only.)"
+
+        out_path = output_dir / f"page-{page_number:03d}.md"
+        write_note(
+            out_path,
+            {
+                "title": f"{pdf_path.stem} - Page {page_number}",
+                "source_pdf": rel_pdf,
+                "source_page": page_number,
+                "tags": ["pdf-page"],
+            },
+            f"## Page {page_number}\n\n{text}\n",
+        )
+        written_paths.append(out_path)
+
+    log.info(
+        "Converted PDF %s into %d markdown page(s) under %s",
+        pdf_path.name,
+        len(written_paths),
+        output_dir.name,
+    )
+    emit_event(
+        config=None,
+        event_type="pdf_converted",
+        source_pdf=pdf_path.name,
+        page_count=len(written_paths),
+    )
+    return written_paths
+
+
+def collect_ingest_paths(config: Config, paths: list[Path] | None = None) -> list[Path]:
+    """Collect markdown paths for ingest, auto-converting PDFs into per-page notes."""
+    if paths is None:
+        candidates = list(config.raw_dir.rglob("*")) if config.raw_dir.exists() else []
+    else:
+        candidates = [Path(path) for path in paths]
+
+    md_paths: list[Path] = []
+    seen: set[str] = set()
+
+    for path in sorted(candidates):
+        if not _is_ingest_candidate(path):
+            continue
+
+        suffix = path.suffix.lower()
+        if suffix == ".pdf":
+            for page_path in convert_pdf_to_markdown(path):
+                key = page_path.resolve().as_posix()
+                if key not in seen:
+                    seen.add(key)
+                    md_paths.append(page_path)
+        elif suffix == ".md":
+            key = path.resolve().as_posix()
+            if key not in seen:
+                seen.add(key)
+                md_paths.append(path)
+
+    return sorted(md_paths)
+
+
 def _collect_media_refs(body: str) -> list[str]:
     """Extract media references from note body for preservation in source pages."""
     refs: list[str] = []
@@ -309,7 +410,7 @@ def _create_source_summary_page(
     config.sources_dir.mkdir(parents=True, exist_ok=True)
 
     now = datetime.now().strftime("%Y-%m-%d")
-    rel_raw = str(path.relative_to(config.vault))
+    rel_raw = path.relative_to(config.vault).as_posix()
     source_url = src_meta.get("source") or src_meta.get("url") or ""
     aliases = generate_aliases(title, "")  # source pages rarely have abbreviations
 
@@ -370,6 +471,7 @@ def ingest_note(
 
     Returns AnalysisResult or None if skipped (duplicate / already ingested).
     """
+    fn_t0 = time.monotonic()
     content = path.read_text(encoding="utf-8")
     # Hash body only (strip frontmatter) so copies are detected as duplicates
     # even after ingest has updated the original's frontmatter (olw_status etc.)
@@ -380,16 +482,39 @@ def ingest_note(
     h = _content_hash(body_for_hash)
 
     # Dedup check
+    rel_path = path.relative_to(config.vault).as_posix()
+
     existing = db.get_raw_by_hash(h)
-    if existing and existing.path != str(path.relative_to(config.vault)):
+    if existing and existing.path != rel_path:
         log.info("Duplicate of %s, skipping %s", existing.path, path.name)
+        emit_event(
+            config,
+            event_type="function_timing",
+            function_name="ingest_note",
+            stage="ingest",
+            model=config.models.fast,
+            success=True,
+            outcome="skipped_duplicate",
+            duration_ms=round((time.monotonic() - fn_t0) * 1000.0, 2),
+            note=path.name,
+        )
         return None
 
-    rel_path = str(path.relative_to(config.vault))
     record = db.get_raw(rel_path)
 
     if record and record.status == "ingested" and not force:
         log.info("Already ingested: %s", path.name)
+        emit_event(
+            config,
+            event_type="function_timing",
+            function_name="ingest_note",
+            stage="ingest",
+            model=config.models.fast,
+            success=True,
+            outcome="skipped_already_ingested",
+            duration_ms=round((time.monotonic() - fn_t0) * 1000.0, 2),
+            note=path.name,
+        )
         return None
 
     # Pre-process web clips
@@ -431,6 +556,19 @@ def ingest_note(
                 error=str(e),
             )
         )
+        emit_event(
+            config,
+            event_type="function_timing",
+            function_name="ingest_note",
+            stage="ingest",
+            model=config.models.fast,
+            success=False,
+            outcome="failed",
+            duration_ms=round((time.monotonic() - fn_t0) * 1000.0, 2),
+            note=path.name,
+            error_class=e.__class__.__name__,
+            error_message=str(e),
+        )
         return None
 
     # Update state DB (raw files stay immutable — metadata lives in state.db only)
@@ -467,6 +605,17 @@ def ingest_note(
         result.quality,
         [c.name for c in result.concepts[:3]],
     )
+    emit_event(
+        config,
+        event_type="function_timing",
+        function_name="ingest_note",
+        stage="ingest",
+        model=config.models.fast,
+        success=True,
+        outcome="ingested",
+        duration_ms=round((time.monotonic() - fn_t0) * 1000.0, 2),
+        note=path.name,
+    )
     return result
 
 
@@ -477,12 +626,8 @@ def ingest_all(
     rag=None,
     force: bool = False,
 ) -> list[tuple[Path, AnalysisResult | None]]:
-    """Ingest all .md files in raw/ (excluding raw/processed/ subfolders)."""
-    raw_files = [
-        p
-        for p in config.raw_dir.rglob("*.md")
-        if "processed" not in p.parts and not p.name.startswith(".")
-    ]
+    """Ingest all markdown files in raw/, including per-page PDF conversions."""
+    raw_files = collect_ingest_paths(config)
     # Snapshot concept names once before loop (for consistent prompt context)
     existing_topics = db.list_all_concept_names()
     results = []

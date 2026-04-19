@@ -31,6 +31,7 @@ from ..protocols import LLMClientProtocol
 from ..sanitize import sanitize_tags
 from ..state import StateDB
 from ..structured_output import StructuredOutputError, request_structured
+from ..telemetry import emit_event
 from ..vault import (
     atomic_write,
     build_wiki_frontmatter,
@@ -352,6 +353,7 @@ def compile_concepts(
     Pass concepts= to compile only a specific subset (e.g. concepts linked to
     recently changed source files). None = compile all needing compile.
     """
+    fn_t0 = time.monotonic()
     all_needing = db.concepts_needing_compile()
     if concepts is not None:
         concept_set = set(concepts)
@@ -361,6 +363,17 @@ def compile_concepts(
 
     if not concept_names:
         log.info("No concepts needing compile")
+        emit_event(
+            config,
+            event_type="function_timing",
+            function_name="compile_concepts",
+            stage="compile",
+            model="mixed",
+            success=True,
+            outcome="no_concepts",
+            duration_ms=round((time.monotonic() - fn_t0) * 1000.0, 2),
+            concept_count=0,
+        )
         return [], [], {}
 
     log.info("Compiling %d concept(s)", len(concept_names))
@@ -379,6 +392,17 @@ def compile_concepts(
                 f"  [concept{stub_tag}] {name} — {len(srcs)} source(s): "
                 f"{', '.join(Path(s).name for s in srcs)}"
             )
+        emit_event(
+            config,
+            event_type="function_timing",
+            function_name="compile_concepts",
+            stage="compile",
+            model="mixed",
+            success=True,
+            outcome="dry_run",
+            duration_ms=round((time.monotonic() - fn_t0) * 1000.0, 2),
+            concept_count=len(concept_names),
+        )
         return [], [], {}
 
     draft_paths: list[Path] = []
@@ -429,6 +453,8 @@ def compile_concepts(
                     system=_STUB_WRITE_SYSTEM,
                     num_ctx=config.effective_provider.fast_ctx,
                     num_predict=min(_MAX_STUB_PREDICT, config.effective_provider.fast_ctx),
+                    telemetry_config=config,
+                    telemetry_stage="compile_stub_write",
                 )
             except (StructuredOutputError, LLMBadRequestError) as e:
                 log.error("Failed to write stub '%s': %s", name, e)
@@ -498,6 +524,8 @@ def compile_concepts(
                 system=_WRITE_SYSTEM,
                 num_ctx=config.effective_provider.heavy_ctx,
                 num_predict=min(_MAX_ARTICLE_PREDICT, config.effective_provider.heavy_ctx),
+                telemetry_config=config,
+                telemetry_stage="compile_article_write",
             )
         except (StructuredOutputError, LLMBadRequestError) as e:
             log.error("Failed to write '%s': %s", name, e)
@@ -525,6 +553,19 @@ def compile_concepts(
     for sp in compiled_sources:
         db.mark_raw_status(sp, "compiled")
 
+    emit_event(
+        config,
+        event_type="function_timing",
+        function_name="compile_concepts",
+        stage="compile",
+        model="mixed",
+        success=True,
+        outcome="completed",
+        duration_ms=round((time.monotonic() - fn_t0) * 1000.0, 2),
+        concept_count=len(concept_names),
+        drafts=len(draft_paths),
+        failed=len(failed),
+    )
     return draft_paths, failed, concept_timings
 
 
@@ -617,6 +658,8 @@ def compile_notes(
             model=config.models.fast,
             system=_PLAN_SYSTEM,
             num_ctx=config.effective_provider.fast_ctx,
+            telemetry_config=config,
+            telemetry_stage="compile_plan",
         )
     except (StructuredOutputError, LLMBadRequestError) as e:
         log.error("Planning failed: %s", e)
@@ -665,6 +708,8 @@ def compile_notes(
                 system=_WRITE_SYSTEM,
                 num_ctx=config.effective_provider.heavy_ctx,
                 num_predict=min(_MAX_ARTICLE_PREDICT, config.effective_provider.heavy_ctx),
+                telemetry_config=config,
+                telemetry_stage="compile_legacy_write",
             )
         except (StructuredOutputError, LLMBadRequestError) as e:
             log.error("Failed to write '%s': %s", article.title, e)
@@ -715,6 +760,7 @@ def approve_drafts(
     Move draft(s) from wiki/.drafts/ to wiki/.
     Returns list of published paths.
     """
+    fn_t0 = time.monotonic()
     if paths is None:
         # Approve all drafts
         paths = list(config.drafts_dir.rglob("*.md")) if config.drafts_dir.exists() else []
@@ -770,6 +816,17 @@ def approve_drafts(
         published.append(target)
         log.info("Published: %s", target.name)
 
+    emit_event(
+        config,
+        event_type="function_timing",
+        function_name="approve_drafts",
+        stage="approve",
+        model="none",
+        success=True,
+        outcome="completed",
+        duration_ms=round((time.monotonic() - fn_t0) * 1000.0, 2),
+        published=len(published),
+    )
     return published
 
 

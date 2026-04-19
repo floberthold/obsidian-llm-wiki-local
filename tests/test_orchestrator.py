@@ -220,8 +220,6 @@ def test_orchestrator_llm_output_not_retried(config, db):
 
 def test_orchestrator_selective_recompile_with_absolute_paths(config, db):
     """Absolute paths from watchdog must be normalized to vault-relative before DB lookup."""
-    import json
-
     db.upsert_raw(RawNoteRecord(path="raw/a.md", content_hash="h1", status="ingested"))
     db.upsert_raw(RawNoteRecord(path="raw/b.md", content_hash="h2", status="ingested"))
     db.upsert_concepts("raw/a.md", ["Alpha"])
@@ -230,29 +228,19 @@ def test_orchestrator_selective_recompile_with_absolute_paths(config, db):
     (config.vault / "raw" / "a.md").write_text("---\ntitle: A\n---\nContent about Alpha.")
     (config.vault / "raw" / "b.md").write_text("---\ntitle: B\n---\nContent about Beta.")
 
-    mock_response = json.dumps({"title": "Alpha", "content": "Alpha content.", "tags": []})
-    client = make_mock_client(mock_response)
+    client = make_mock_client()
 
     # Pass absolute path (as watchdog would supply it)
     abs_path = str(config.vault / "raw" / "a.md")
 
-    import obsidian_llm_wiki.pipeline.ingest as ingest_mod
+    with patch("obsidian_llm_wiki.pipeline.ingest.ingest_note", return_value=object()):
+        with patch("obsidian_llm_wiki.pipeline.orchestrator._run_compile") as mock_compile:
+            mock_compile.return_value = ([], [], {})
+            orch = PipelineOrchestrator(config, client, db)
+            orch.run(paths=[abs_path])
 
-    original_ingest = ingest_mod.ingest_note
-
-    def fake_ingest(path, config, client, db):
-        return object()  # truthy — simulates successful ingest
-
-    ingest_mod.ingest_note = fake_ingest
-    try:
-        orch = PipelineOrchestrator(config, client, db)
-        orch.run(paths=[abs_path])
-    finally:
-        ingest_mod.ingest_note = original_ingest
-
-    # Alpha was the linked concept; Beta should still need compile
-    needing = db.concepts_needing_compile()
-    assert "Beta" in needing
+    assert mock_compile.call_count == 1
+    assert mock_compile.call_args.kwargs["concepts"] == ["Alpha"]
 
 
 def test_orchestrator_auto_approve(config, db):
@@ -295,6 +283,34 @@ def test_orchestrator_lint_runs_when_no_drafts_produced(config, db):
         lint_mod.run_lint = original_lint
 
     assert len(lint_called) == 1  # lint ran despite zero new drafts
+
+
+def test_orchestrator_dry_run_converts_pdf_into_page_markdown(config, db, monkeypatch):
+    pdf_path = config.vault / "raw" / "Slides.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4")
+
+    class _FakePage:
+        def __init__(self, text):
+            self._text = text
+
+        def extract_text(self):
+            return self._text
+
+    class _FakeReader:
+        def __init__(self, _path):
+            self.pages = [_FakePage("First"), _FakePage("Second")]
+
+    import sys
+    import types
+
+    monkeypatch.setitem(sys.modules, "pypdf", types.SimpleNamespace(PdfReader=_FakeReader))
+
+    orch = PipelineOrchestrator(config, make_mock_client(), db)
+    report = orch.run(paths=[str(pdf_path)], dry_run=True)
+
+    assert report.ingested == 2
+    assert (config.vault / "raw" / "Slides" / "page-001.md").exists()
+    assert (config.vault / "raw" / "Slides" / "page-002.md").exists()
 
 
 def test_orchestrator_ingest_exception_logged_not_raised(config, db):

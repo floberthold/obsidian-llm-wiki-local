@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import sys
+import types
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -14,9 +16,12 @@ from obsidian_llm_wiki.pipeline.ingest import (
     _SYSTEM,
     _analyze_body,
     _build_analysis_prompt,
+    _page_output_dir,
     _merge_chunk_results,
     _normalize_concepts,
     _preprocess_web_clip,
+    collect_ingest_paths,
+    convert_pdf_to_markdown,
     ingest_note,
 )
 from obsidian_llm_wiki.state import StateDB
@@ -516,3 +521,81 @@ def test_merge_chunk_results_picks_first_detected_language():
     )
     merged = _merge_chunk_results([make(None), make("de"), make("fr")])
     assert merged.language == "de"
+
+
+def test_convert_pdf_to_markdown_creates_one_file_per_page(vault, monkeypatch):
+    pdf_path = vault / "raw" / "OneNote" / "Team Notes.pdf"
+    pdf_path.parent.mkdir(parents=True)
+    pdf_path.write_bytes(b"%PDF-1.4")
+
+    class _FakePage:
+        def __init__(self, text):
+            self._text = text
+
+        def extract_text(self):
+            return self._text
+
+    class _FakeReader:
+        def __init__(self, _path):
+            self.pages = [_FakePage("Alpha"), _FakePage("Beta")]
+
+    monkeypatch.setitem(sys.modules, "pypdf", types.SimpleNamespace(PdfReader=_FakeReader))
+
+    written = convert_pdf_to_markdown(pdf_path)
+
+    assert [p.name for p in written] == ["page-001.md", "page-002.md"]
+    assert all(p.parent == _page_output_dir(pdf_path) for p in written)
+    assert "## Page 1" in written[0].read_text(encoding="utf-8")
+    assert "Alpha" in written[0].read_text(encoding="utf-8")
+    assert "## Page 2" in written[1].read_text(encoding="utf-8")
+    assert "Beta" in written[1].read_text(encoding="utf-8")
+
+
+def test_collect_ingest_paths_includes_existing_md_and_converted_pdf_pages(vault, config, monkeypatch):
+    md_path = _write_raw(vault, "note.md", "# Existing\n\nContent")
+    pdf_path = vault / "raw" / "Docs" / "Deck.pdf"
+    pdf_path.parent.mkdir(parents=True)
+    pdf_path.write_bytes(b"%PDF-1.4")
+
+    class _FakePage:
+        def __init__(self, text):
+            self._text = text
+
+        def extract_text(self):
+            return self._text
+
+    class _FakeReader:
+        def __init__(self, _path):
+            self.pages = [_FakePage("One"), _FakePage("Two")]
+
+    monkeypatch.setitem(sys.modules, "pypdf", types.SimpleNamespace(PdfReader=_FakeReader))
+
+    collected = collect_ingest_paths(config)
+
+    names = {p.name for p in collected}
+    assert md_path.name in names
+    assert "page-001.md" in names
+    assert "page-002.md" in names
+
+
+def test_collect_ingest_paths_explicit_pdf_returns_page_files(vault, config, monkeypatch):
+    pdf_path = vault / "raw" / "Multi Page.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4")
+
+    class _FakePage:
+        def __init__(self, text):
+            self._text = text
+
+        def extract_text(self):
+            return self._text
+
+    class _FakeReader:
+        def __init__(self, _path):
+            self.pages = [_FakePage("One page")]
+
+    monkeypatch.setitem(sys.modules, "pypdf", types.SimpleNamespace(PdfReader=_FakeReader))
+
+    collected = collect_ingest_paths(config, [pdf_path])
+
+    assert len(collected) == 1
+    assert collected[0] == _page_output_dir(pdf_path) / "page-001.md"

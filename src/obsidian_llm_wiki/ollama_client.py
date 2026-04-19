@@ -6,10 +6,12 @@ Replaces the entire langchain/langchain-ollama dependency tree.
 from __future__ import annotations
 
 import logging
+import time
 
 import httpx
 
 from .openai_compat_client import LLMError
+from .telemetry import emit_event
 
 log = logging.getLogger(__name__)
 
@@ -96,6 +98,8 @@ class OllamaClient:
         format: str | None = None,
         num_ctx: int = 8192,
         num_predict: int = -1,
+        telemetry_config=None,
+        telemetry_stage: str = "",
     ) -> str:
         payload: dict = {
             "model": model,
@@ -106,18 +110,80 @@ class OllamaClient:
         }
         if format:
             payload["format"] = format
+
+        t0 = time.monotonic()
         try:
             resp = self._client.post(f"{self.base_url}/api/generate", json=payload)
             resp.raise_for_status()
+            text = resp.json()["response"]
         except httpx.ConnectError:
+            emit_event(
+                telemetry_config,
+                event_type="provider_request",
+                function_name="OllamaClient.generate",
+                stage=telemetry_stage or "generate",
+                provider="ollama",
+                model=model,
+                success=False,
+                duration_ms=round((time.monotonic() - t0) * 1000.0, 2),
+                num_ctx=num_ctx,
+                num_predict=num_predict,
+                prompt_chars=len(prompt),
+                error_class="ConnectError",
+            )
             raise OllamaError(_STARTUP_HINT)
         except httpx.TimeoutException as e:
+            emit_event(
+                telemetry_config,
+                event_type="provider_request",
+                function_name="OllamaClient.generate",
+                stage=telemetry_stage or "generate",
+                provider="ollama",
+                model=model,
+                success=False,
+                duration_ms=round((time.monotonic() - t0) * 1000.0, 2),
+                num_ctx=num_ctx,
+                num_predict=num_predict,
+                prompt_chars=len(prompt),
+                error_class=e.__class__.__name__,
+                error_message=str(e),
+            )
             raise OllamaError(f"Ollama request timed out: {e}") from e
         except httpx.HTTPStatusError as e:
+            emit_event(
+                telemetry_config,
+                event_type="provider_request",
+                function_name="OllamaClient.generate",
+                stage=telemetry_stage or "generate",
+                provider="ollama",
+                model=model,
+                success=False,
+                duration_ms=round((time.monotonic() - t0) * 1000.0, 2),
+                num_ctx=num_ctx,
+                num_predict=num_predict,
+                prompt_chars=len(prompt),
+                error_class=e.__class__.__name__,
+                error_message=f"{e.response.status_code} {e.response.text}",
+            )
             raise OllamaError(
                 f"Ollama HTTP error: {e.response.status_code} {e.response.text}"
             ) from e
-        return resp.json()["response"]
+
+        emit_event(
+            telemetry_config,
+            event_type="provider_request",
+            function_name="OllamaClient.generate",
+            stage=telemetry_stage or "generate",
+            provider="ollama",
+            model=model,
+            success=True,
+            duration_ms=round((time.monotonic() - t0) * 1000.0, 2),
+            num_ctx=num_ctx,
+            num_predict=num_predict,
+            prompt_chars=len(prompt),
+            response_chars=len(text),
+        )
+        return text
 
     # ── Embeddings ────────────────────────────────────────────────────────────
 

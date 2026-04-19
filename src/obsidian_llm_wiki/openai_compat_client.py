@@ -25,8 +25,11 @@ JSON mode: if supports_json_mode=True, format="json" injects
 from __future__ import annotations
 
 import logging
+import time
 
 import httpx
+
+from .telemetry import emit_event
 
 log = logging.getLogger(__name__)
 
@@ -177,6 +180,8 @@ class OpenAICompatClient:
         format: str | None = None,
         num_ctx: int = 8192,
         num_predict: int = -1,
+        telemetry_config=None,
+        telemetry_stage: str = "",
     ) -> str:
         """
         Call /v1/chat/completions. Signature is identical to OllamaClient.generate().
@@ -199,6 +204,8 @@ class OpenAICompatClient:
         if num_predict > 0:
             payload["max_tokens"] = num_predict
 
+        t0 = time.monotonic()
+        downgrade_count = 0
         try:
             resp = self._client.post(self._chat_url(), json=payload)
             # Each auto-downgrade strips one unsupported field and retries.
@@ -212,6 +219,7 @@ class OpenAICompatClient:
                     "%s: HTTP 400 with response_format, retrying without json mode",
                     self.provider_name,
                 )
+                downgrade_count += 1
                 current_payload = {
                     k: v for k, v in current_payload.items() if k != "response_format"
                 }
@@ -225,6 +233,7 @@ class OpenAICompatClient:
                         "%s: HTTP 400 n_keep error, retrying without max_tokens",
                         self.provider_name,
                     )
+                    downgrade_count += 1
                     current_payload = {
                         k: v for k, v in current_payload.items() if k != "max_tokens"
                     }
@@ -232,18 +241,99 @@ class OpenAICompatClient:
 
             resp.raise_for_status()
         except httpx.HTTPStatusError as e:
+            emit_event(
+                telemetry_config,
+                event_type="provider_request",
+                function_name="OpenAICompatClient.generate",
+                stage=telemetry_stage or "generate",
+                provider=self.provider_name,
+                model=model,
+                success=False,
+                duration_ms=round((time.monotonic() - t0) * 1000.0, 2),
+                num_ctx=num_ctx,
+                num_predict=num_predict,
+                prompt_chars=len(prompt),
+                downgrade_count=downgrade_count,
+                error_class=e.__class__.__name__,
+                error_message=f"{e.response.status_code} {e.response.text[:200]}",
+            )
             raise self._wrap_error(e) from e
         except httpx.TimeoutException as e:
+            emit_event(
+                telemetry_config,
+                event_type="provider_request",
+                function_name="OpenAICompatClient.generate",
+                stage=telemetry_stage or "generate",
+                provider=self.provider_name,
+                model=model,
+                success=False,
+                duration_ms=round((time.monotonic() - t0) * 1000.0, 2),
+                num_ctx=num_ctx,
+                num_predict=num_predict,
+                prompt_chars=len(prompt),
+                downgrade_count=downgrade_count,
+                error_class=e.__class__.__name__,
+                error_message=str(e),
+            )
             raise self._wrap_error(e) from e
         except httpx.RequestError as e:
+            emit_event(
+                telemetry_config,
+                event_type="provider_request",
+                function_name="OpenAICompatClient.generate",
+                stage=telemetry_stage or "generate",
+                provider=self.provider_name,
+                model=model,
+                success=False,
+                duration_ms=round((time.monotonic() - t0) * 1000.0, 2),
+                num_ctx=num_ctx,
+                num_predict=num_predict,
+                prompt_chars=len(prompt),
+                downgrade_count=downgrade_count,
+                error_class=e.__class__.__name__,
+                error_message=str(e),
+            )
             raise self._wrap_error(e) from e
 
         try:
-            return resp.json()["choices"][0]["message"]["content"]
+            text = resp.json()["choices"][0]["message"]["content"]
         except (KeyError, IndexError, ValueError) as e:
+            emit_event(
+                telemetry_config,
+                event_type="provider_request",
+                function_name="OpenAICompatClient.generate",
+                stage=telemetry_stage or "generate",
+                provider=self.provider_name,
+                model=model,
+                success=False,
+                duration_ms=round((time.monotonic() - t0) * 1000.0, 2),
+                num_ctx=num_ctx,
+                num_predict=num_predict,
+                prompt_chars=len(prompt),
+                downgrade_count=downgrade_count,
+                error_class=e.__class__.__name__,
+                error_message=resp.text[:200],
+            )
             raise LLMError(
                 f"{self.provider_name}: unexpected response format: {resp.text[:200]}"
             ) from e
+
+        emit_event(
+            telemetry_config,
+            event_type="provider_request",
+            function_name="OpenAICompatClient.generate",
+            stage=telemetry_stage or "generate",
+            provider=self.provider_name,
+            model=model,
+            success=True,
+            duration_ms=round((time.monotonic() - t0) * 1000.0, 2),
+            num_ctx=num_ctx,
+            num_predict=num_predict,
+            prompt_chars=len(prompt),
+            response_chars=len(text),
+            downgrade_count=downgrade_count,
+        )
+        return text
 
     # ── Embeddings ────────────────────────────────────────────────────────────
 
