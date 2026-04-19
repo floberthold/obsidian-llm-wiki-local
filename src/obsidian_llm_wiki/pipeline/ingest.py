@@ -42,6 +42,18 @@ def _content_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+def _read_text_with_fallback(path: Path) -> str:
+    """Read text files with practical encoding fallbacks for user-authored notes."""
+    raw = path.read_bytes()
+    for enc in ("utf-8", "utf-8-sig", "cp1252", "latin-1"):
+        try:
+            return raw.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    # Latin-1 should always succeed, but keep a final safe guard.
+    return raw.decode("utf-8", errors="replace")
+
+
 def _build_analysis_prompt(
     body: str,
     existing_concepts: list[str],
@@ -473,14 +485,20 @@ def ingest_note(
     Returns AnalysisResult or None if skipped (duplicate / already ingested).
     """
     fn_t0 = time.monotonic()
-    content = path.read_text(encoding="utf-8")
-    # Hash body only (strip frontmatter) so copies are detected as duplicates
-    # even after ingest has updated the original's frontmatter (olw_status etc.)
     try:
-        _, body_for_hash = parse_note(path)
+        meta, body = parse_note(path)
     except Exception:
-        body_for_hash = content
-    h = _content_hash(body_for_hash)
+        meta, body = {}, _read_text_with_fallback(path)
+
+    # Hash body only (strip frontmatter) so copies are detected as duplicates
+    # even after ingest has updated the original's frontmatter (olw_status etc.).
+    # Exception: when source_pdf is set (PDF-extracted pages), include it in the
+    # hash so pages from *different* PDFs with identical text are not falsely
+    # flagged as duplicates.
+    source_pdf = meta.get("source_pdf", "")
+    body_for_hash = body
+    hash_input = (source_pdf + "\x00" + body_for_hash) if source_pdf else body_for_hash
+    h = _content_hash(hash_input)
 
     # Dedup check
     rel_path = path.relative_to(config.vault).as_posix()
@@ -519,7 +537,6 @@ def ingest_note(
         return None
 
     # Pre-process web clips
-    meta, body = parse_note(path)
     if meta.get("source") or meta.get("url"):  # web clipper adds these
         body = _preprocess_web_clip(body)
 

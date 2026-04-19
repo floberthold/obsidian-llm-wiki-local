@@ -258,7 +258,43 @@ def test_ingest_note_dedup_by_hash(vault, config, db):
     assert client.generate.call_count == 1
 
 
-def test_ingest_note_stores_concepts(vault, config, db):
+def test_ingest_note_pdf_pages_with_same_body_different_source_not_deduplicated(vault, config, db):
+    """PDF pages from different source PDFs must not be treated as duplicates
+    even if their extracted text is identical (e.g. blank pages, boilerplate)."""
+    body = "# Page 1\n\nBoilerplate disclaimer text identical across documents."
+    fm1 = "---\nsource_pdf: raw/FolderA/doc.pdf\n---\n"
+    fm2 = "---\nsource_pdf: raw/FolderB/doc.pdf\n---\n"
+    (vault / "raw" / "subA").mkdir()
+    (vault / "raw" / "subB").mkdir()
+    p1 = vault / "raw" / "subA" / "page-001.md"
+    p2 = vault / "raw" / "subB" / "page-001.md"
+    p1.write_text(fm1 + body, encoding="utf-8")
+    p2.write_text(fm2 + body, encoding="utf-8")
+    client = _make_client(_analysis_json())
+    r1 = ingest_note(p1, config, client, db)
+    r2 = ingest_note(p2, config, client, db)
+    assert r1 is not None, "first PDF page should be ingested"
+    assert r2 is not None, "second PDF page from different source must NOT be skipped as duplicate"
+    assert client.generate.call_count == 2
+
+
+def test_ingest_note_pdf_pages_same_source_same_body_are_deduplicated(vault, config, db):
+    """PDF pages from the *same* source PDF with identical text remain deduplicated."""
+    body = "# Page 1\n\nBoilerplate disclaimer text identical across pages."
+    fm = "---\nsource_pdf: raw/FolderA/doc.pdf\n---\n"
+    (vault / "raw" / "subA").mkdir()
+    p1 = vault / "raw" / "subA" / "page-001.md"
+    p2 = vault / "raw" / "subA" / "page-002.md"
+    p1.write_text(fm + body, encoding="utf-8")
+    p2.write_text(fm + body, encoding="utf-8")
+    client = _make_client(_analysis_json())
+    ingest_note(p1, config, client, db)
+    result = ingest_note(p2, config, client, db)
+    assert result is None, "same body from same PDF should still be skipped as duplicate"
+    assert client.generate.call_count == 1
+
+
+
     path = _write_raw(vault, "ml.md", "# ML\n\nNeural networks and backprop.")
     client = _make_client(_analysis_json(concepts=["Neural Networks", "Backpropagation"]))
     ingest_note(path, config, client, db)

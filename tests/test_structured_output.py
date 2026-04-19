@@ -160,6 +160,20 @@ def test_single_article_sanitizes_tags():
     assert "C++" not in article.tags
 
 
+def test_analysis_result_coerces_string_concepts():
+    """LLMs often return concepts as plain strings; validator must coerce to Concept objects."""
+    result = AnalysisResult(
+        summary="A note about SAP.",
+        concepts=["SAP Process Mining", "Technical Configuration"],  # type: ignore[list-item]
+        suggested_topics=[],
+        quality="high",
+    )
+    assert len(result.concepts) == 2
+    assert result.concepts[0].name == "SAP Process Mining"
+    assert result.concepts[1].name == "Technical Configuration"
+    assert result.concepts[0].aliases == []
+
+
 def test_num_predict_passed_to_generate():
     """num_predict forwarded to client.generate so output isn't truncated mid-JSON."""
     raw = json.dumps({"title": "T", "content": "body", "tags": ["t"]})
