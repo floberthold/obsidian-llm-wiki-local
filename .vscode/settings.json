@@ -4,6 +4,11 @@
             "approve": true,
             "matchCommandLine": true
         },
-        "ollama": true
+        "ollama": true,
+        "/^python -m pytest tests/test_orchestrator\\.py -q$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "uv": true
     }
 }

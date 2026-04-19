@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 import logging
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -167,12 +168,21 @@ class PipelineOrchestrator:
             if configured_workers <= 0:
                 configured_workers = 4
             max_workers = max(1, min(ingest_total, configured_workers))
+            log.info(
+                "Parallel ingest enabled: %d worker(s) for %d note(s)",
+                max_workers,
+                ingest_total,
+            )
 
             def _ingest_one(raw_path_str: str) -> tuple[str, str, bool, float]:
                 step_t0 = time.monotonic()
                 p = Path(raw_path_str)
+                worker_name = threading.current_thread().name
                 if not p.exists():
+                    log.info("[%s] SKIP missing %s", worker_name, p.name)
                     return raw_path_str, p.name, False, time.monotonic() - step_t0
+
+                log.info("[%s] START %s", worker_name, p.name)
 
                 worker_db = StateDB(config.state_db_path)
                 try:
@@ -183,15 +193,25 @@ class PipelineOrchestrator:
                         db=worker_db,
                         existing_topics=existing_topics,
                     )
-                    return raw_path_str, p.name, result is not None, time.monotonic() - step_t0
+                    elapsed = time.monotonic() - step_t0
+                    if result is not None:
+                        log.info("[%s] DONE ingest %s (%.1fs)", worker_name, p.name, elapsed)
+                    else:
+                        log.info("[%s] DONE skip %s (%.1fs)", worker_name, p.name, elapsed)
+                    return raw_path_str, p.name, result is not None, elapsed
                 except Exception as e:
                     log.error("Ingest failed for %s: %s", p.name, e)
-                    return raw_path_str, p.name, False, time.monotonic() - step_t0
+                    elapsed = time.monotonic() - step_t0
+                    log.info("[%s] DONE failed %s (%.1fs)", worker_name, p.name, elapsed)
+                    return raw_path_str, p.name, False, elapsed
                 finally:
                     worker_db.close()
 
             completed = 0
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            executor = ThreadPoolExecutor(max_workers=max_workers)
+            interrupted = False
+            futures = []
+            try:
                 futures = [executor.submit(_ingest_one, raw_path_str) for raw_path_str in md_paths]
                 for future in as_completed(futures):
                     raw_path_str, note_name, success, duration_s = future.result()
@@ -210,6 +230,16 @@ class PipelineOrchestrator:
                                 avg = sum(basis) / len(basis)
                                 eta = avg * (ingest_total - completed)
                         on_progress("ingest", completed, ingest_total, eta, note_name)
+            except KeyboardInterrupt:
+                interrupted = True
+                # Avoid waiting for all worker threads when user cancels.
+                for future in futures:
+                    future.cancel()
+                executor.shutdown(wait=False, cancel_futures=True)
+                raise
+            finally:
+                if not interrupted:
+                    executor.shutdown(wait=True)
 
         report.timings["ingest"] = time.monotonic() - t0
 

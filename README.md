@@ -100,7 +100,7 @@ set OLLAMA_NUM_PARALLEL=8
 
 Or one line:
 
-    set OLLAMA_NUM_PARALLEL=8 && ollama serve
+    set OLLAMA_NUM_PARALLEL=8 && setx OLLAMA_NUM_THREADS 12 && ollama serve
 
 Then in a second cmd window (for the pipeline):
 
@@ -108,7 +108,7 @@ Then in a second cmd window (for the pipeline):
 
 Or: 
 
-    set OLLAMA_NUM_PARALLEL=8 && setx OLLAMA_NUM_THREADS 12 && olw run
+    set OLLAMA_NUM_PARALLEL=8 && olw run
 
 ### 2c. Windows startup guide (parallel CPU setup)
 

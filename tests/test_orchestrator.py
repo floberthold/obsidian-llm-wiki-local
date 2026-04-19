@@ -338,6 +338,66 @@ def test_orchestrator_selective_recompile_with_absolute_paths(config, db):
     assert mock_compile.call_args.kwargs["concepts"] == ["Alpha"]
 
 
+def test_orchestrator_parallel_ingest_ctrl_c_cancels_futures(config, db, monkeypatch):
+    """KeyboardInterrupt during parallel ingest cancels pending futures immediately."""
+    for name in ["a.md", "b.md"]:
+        (config.vault / "raw" / name).write_text("---\ntitle: Note\n---\nBody")
+
+    monkeypatch.setenv("OLLAMA_NUM_PARALLEL", "4")
+
+    class _FakeFuture:
+        def __init__(self) -> None:
+            self.cancelled = False
+
+        def cancel(self) -> bool:
+            self.cancelled = True
+            return True
+
+    class _FakeExecutor:
+        def __init__(self, max_workers: int) -> None:
+            self.max_workers = max_workers
+            self.futures: list[_FakeFuture] = []
+            self.shutdown_calls: list[tuple[bool, bool]] = []
+
+        def submit(self, fn, raw_path_str):  # noqa: ANN001
+            fut = _FakeFuture()
+            self.futures.append(fut)
+            return fut
+
+        def shutdown(self, wait: bool = True, cancel_futures: bool = False) -> None:
+            self.shutdown_calls.append((wait, cancel_futures))
+
+    fake_executor = _FakeExecutor(max_workers=4)
+
+    def _fake_executor_factory(*, max_workers: int):
+        fake_executor.max_workers = max_workers
+        return fake_executor
+
+    with patch("obsidian_llm_wiki.pipeline.ingest.ingest_note", return_value=object()):
+        with patch(
+            "obsidian_llm_wiki.pipeline.orchestrator.ThreadPoolExecutor",
+            side_effect=_fake_executor_factory,
+        ):
+            with patch(
+                "obsidian_llm_wiki.pipeline.orchestrator.as_completed",
+                side_effect=KeyboardInterrupt,
+            ):
+                with patch("obsidian_llm_wiki.pipeline.orchestrator._run_compile") as mock_compile:
+                    mock_compile.return_value = ([], [], {})
+                    orch = PipelineOrchestrator(config, make_mock_client(), db)
+                    with pytest.raises(KeyboardInterrupt):
+                        orch.run(
+                            paths=[
+                                str(config.vault / "raw" / "a.md"),
+                                str(config.vault / "raw" / "b.md"),
+                            ]
+                        )
+
+    assert fake_executor.shutdown_calls
+    assert fake_executor.shutdown_calls[0] == (False, True)
+    assert all(f.cancelled for f in fake_executor.futures)
+
+
 def test_orchestrator_auto_approve(config, db):
     """auto_approve=True publishes drafts returned from compile."""
     import json
