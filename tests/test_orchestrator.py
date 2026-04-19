@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -207,6 +208,65 @@ def test_orchestrator_passes_existing_topics_snapshot_to_ingest(config, db):
     existing_topics = mock_ingest.call_args.kwargs.get("existing_topics")
     assert existing_topics is not None
     assert "Seed Concept" in existing_topics
+
+
+def test_orchestrator_ingest_eta_fallback_when_all_skipped(config, db, monkeypatch):
+    for name in ["a.md", "b.md"]:
+        (config.vault / "raw" / name).write_text("---\ntitle: Note\n---\nBody")
+
+    monkeypatch.setenv("OLLAMA_NUM_PARALLEL", "1")
+    updates: list[tuple[str, int, int, float | None, str]] = []
+
+    with patch("obsidian_llm_wiki.pipeline.ingest.ingest_note", return_value=None):
+        with patch("obsidian_llm_wiki.pipeline.orchestrator._run_compile") as mock_compile:
+            mock_compile.return_value = ([], [], {})
+            orch = PipelineOrchestrator(config, make_mock_client(), db)
+            orch.run(
+                paths=[str(config.vault / "raw" / "a.md"), str(config.vault / "raw" / "b.md")],
+                on_progress=lambda *args: updates.append(args),
+            )
+
+    ingest_updates = [u for u in updates if u[0] == "ingest"]
+    assert ingest_updates
+    # ETA should still be emitted for non-final progress even if every note is skipped.
+    assert ingest_updates[0][3] is not None
+
+
+def test_orchestrator_ingest_eta_prefers_processed_durations(config, db, monkeypatch):
+    for name in ["a.md", "b.md", "c.md"]:
+        (config.vault / "raw" / name).write_text("---\ntitle: Note\n---\nBody")
+
+    monkeypatch.setenv("OLLAMA_NUM_PARALLEL", "1")
+    updates: list[tuple[str, int, int, float | None, str]] = []
+    call_idx = {"n": 0}
+
+    def fake_ingest_note(**kwargs):
+        call_idx["n"] += 1
+        if call_idx["n"] == 1:
+            return None
+        time.sleep(0.04)
+        return object()
+
+    with patch("obsidian_llm_wiki.pipeline.ingest.ingest_note", side_effect=fake_ingest_note):
+        with patch("obsidian_llm_wiki.pipeline.orchestrator._run_compile") as mock_compile:
+            mock_compile.return_value = ([], [], {})
+            orch = PipelineOrchestrator(config, make_mock_client(), db)
+            report = orch.run(
+                paths=[
+                    str(config.vault / "raw" / "a.md"),
+                    str(config.vault / "raw" / "b.md"),
+                    str(config.vault / "raw" / "c.md"),
+                ],
+                on_progress=lambda *args: updates.append(args),
+            )
+
+    ingest_updates = [u for u in updates if u[0] == "ingest"]
+    assert len(ingest_updates) == 3
+    eta_after_second = ingest_updates[1][3]
+    assert eta_after_second is not None
+    # After one skipped + one processed note, ETA should be anchored on processed timings.
+    assert eta_after_second > 0.025
+    assert report.ingested == 2
 
 
 def test_orchestrator_run_rounds_default_one(config, db):

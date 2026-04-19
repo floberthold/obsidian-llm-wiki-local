@@ -110,6 +110,7 @@ class PipelineOrchestrator:
 
         log.info("── Ingest (%d note(s)) ──────────────────────────────────", len(md_paths))
         ingest_durations: list[float] = []
+        ingest_processed_durations: list[float] = []
         ingest_total = len(md_paths)
         # Snapshot concept names once per ingest run to avoid repeated full-table scans.
         existing_topics = db.list_all_concept_names()
@@ -117,6 +118,7 @@ class PipelineOrchestrator:
             for idx, raw_path_str in enumerate(md_paths, 1):
                 step_t0 = time.monotonic()
                 p = Path(raw_path_str)
+                processed = False
                 if not p.exists():
                     continue
                 if dry_run:
@@ -138,17 +140,23 @@ class PipelineOrchestrator:
                         existing_topics=existing_topics,
                     )
                     if result is not None:
+                        processed = True
                         report.ingested += 1
                         ingested_paths.append(raw_path_str)
                 except Exception as e:
                     log.error("Ingest failed for %s: %s", p.name, e)
                 finally:
-                    ingest_durations.append(time.monotonic() - step_t0)
+                    elapsed = time.monotonic() - step_t0
+                    ingest_durations.append(elapsed)
+                    if processed:
+                        ingest_processed_durations.append(elapsed)
                     if on_progress and ingest_total:
                         eta = None
                         if idx < ingest_total:
-                            avg = sum(ingest_durations) / len(ingest_durations)
-                            eta = avg * (ingest_total - idx)
+                            basis = ingest_processed_durations or ingest_durations
+                            if basis:
+                                avg = sum(basis) / len(basis)
+                                eta = avg * (ingest_total - idx)
                         on_progress("ingest", idx, ingest_total, eta, p.name)
         else:
             env_parallel = os.getenv("OLLAMA_NUM_PARALLEL", "").strip()
@@ -190,14 +198,17 @@ class PipelineOrchestrator:
                     completed += 1
                     ingest_durations.append(duration_s)
                     if success:
+                        ingest_processed_durations.append(duration_s)
                         report.ingested += 1
                         ingested_paths.append(raw_path_str)
 
                     if on_progress and ingest_total:
                         eta = None
                         if completed < ingest_total:
-                            avg = sum(ingest_durations) / len(ingest_durations)
-                            eta = avg * (ingest_total - completed)
+                            basis = ingest_processed_durations or ingest_durations
+                            if basis:
+                                avg = sum(basis) / len(basis)
+                                eta = avg * (ingest_total - completed)
                         on_progress("ingest", completed, ingest_total, eta, note_name)
 
         report.timings["ingest"] = time.monotonic() - t0

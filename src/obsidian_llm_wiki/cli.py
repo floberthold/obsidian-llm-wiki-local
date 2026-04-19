@@ -681,6 +681,7 @@ def ingest(vault_str, ingest_all, force, paths):
 
     skipped = ingested = failed = 0
     durations: list[float] = []
+    processed_durations: list[float] = []
     total_paths = len(target_paths)
 
     with Progress(
@@ -719,10 +720,14 @@ def ingest(vault_str, ingest_all, force, paths):
                     skipped += 1
             else:
                 ingested += 1
-            durations.append(time.monotonic() - step_t0)
+            elapsed = time.monotonic() - step_t0
+            durations.append(elapsed)
+            if result is not None:
+                processed_durations.append(elapsed)
             eta = None
             if idx < total_paths and durations:
-                eta = (sum(durations) / len(durations)) * (total_paths - idx)
+                basis = processed_durations or durations
+                eta = (sum(basis) / len(basis)) * (total_paths - idx)
             progress.update(
                 task,
                 description=f"[dim]{path.name} | {(idx / total_paths) * 100:5.1f}%"
