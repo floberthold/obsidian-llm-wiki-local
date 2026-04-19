@@ -10,6 +10,20 @@ from obsidian_llm_wiki.ollama_client import OllamaClient
 from obsidian_llm_wiki.state import StateDB
 
 
+def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    """Skip benchmark tests when pytest-benchmark plugin is unavailable."""
+    has_benchmark = config.pluginmanager.hasplugin("benchmark") or config.pluginmanager.hasplugin(
+        "pytest_benchmark"
+    )
+    if has_benchmark:
+        return
+
+    skip_benchmark = pytest.mark.skip(reason="pytest-benchmark plugin not installed")
+    for item in items:
+        if "benchmark" in getattr(item, "fixturenames", ()):  # benchmark fixture-driven tests
+            item.add_marker(skip_benchmark)
+
+
 @pytest.fixture
 def vault(tmp_path: Path) -> Path:
     """Minimal vault structure for testing."""
