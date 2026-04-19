@@ -106,6 +106,7 @@ class OllamaClient:
             "prompt": prompt,
             "system": system,
             "stream": False,
+            "think": False,
             "options": {"num_ctx": num_ctx, "num_predict": num_predict},
         }
         if format:
@@ -115,7 +116,8 @@ class OllamaClient:
         try:
             resp = self._client.post(f"{self.base_url}/api/generate", json=payload)
             resp.raise_for_status()
-            text = resp.json()["response"]
+            data = resp.json()
+            text = data.get("response") or data.get("thinking", "")
         except httpx.ConnectError:
             emit_event(
                 telemetry_config,

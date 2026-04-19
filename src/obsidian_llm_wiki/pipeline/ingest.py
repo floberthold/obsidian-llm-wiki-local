@@ -321,7 +321,8 @@ def convert_pdf_to_markdown(pdf_path: Path, overwrite: bool = False) -> list[Pat
     for page_number, page in enumerate(reader.pages, start=1):
         text = (page.extract_text() or "").strip()
         if not text:
-            text = "(No extractable text found on this page. The PDF may be image-only.)"
+            log.debug("Skipping image-only PDF page %d in %s", page_number, pdf_path.name)
+            continue
 
         out_path = output_dir / f"page-{page_number:03d}.md"
         write_note(
@@ -521,6 +522,26 @@ def ingest_note(
     meta, body = parse_note(path)
     if meta.get("source") or meta.get("url"):  # web clipper adds these
         body = _preprocess_web_clip(body)
+
+    # Skip notes with no usable content (e.g. image-only PDF pages already on disk)
+    _EMPTY_BODY_MARKERS = (
+        "(No extractable text found on this page. The PDF may be image-only.)",
+    )
+    stripped_body = body.strip()
+    if not stripped_body or stripped_body in _EMPTY_BODY_MARKERS:
+        log.info("Skipping empty/image-only note: %s", path.name)
+        emit_event(
+            config,
+            event_type="function_timing",
+            function_name="ingest_note",
+            stage="ingest",
+            model=config.models.fast,
+            success=True,
+            outcome="skipped_empty",
+            duration_ms=round((time.monotonic() - fn_t0) * 1000.0, 2),
+            note=path.name,
+        )
+        return None
 
     # Chunk + embed only when RAG store is wired in (Phase 2)
     if rag is not None:
