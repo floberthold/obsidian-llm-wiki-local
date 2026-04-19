@@ -509,7 +509,7 @@ def test_merge_unions_topics():
 
 
 def test_analyze_body_single_call_for_short_note(vault, config, db):
-    """Body <= fast_ctx // 2 → exactly one generate call."""
+    """Body <= fast_ctx * ingest_chunk_ratio -> exactly one generate call."""
     client = _make_client(_analysis_json())
     body = "Short note content."
     _analyze_body(body, [], "test.md", client, config)
@@ -517,9 +517,9 @@ def test_analyze_body_single_call_for_short_note(vault, config, db):
 
 
 def test_analyze_body_multi_call_for_long_note(vault, config, db):
-    """Body > fast_ctx // 2 → one call per chunk."""
+    """Body > fast_ctx * ingest_chunk_ratio -> one call per chunk."""
     config2 = Config(vault=vault, ollama={"fast_ctx": 100})  # tiny ctx for test
-    chunk_size = 100 // 2  # = 50 chars per chunk
+    chunk_size = int(100 * config2.pipeline.ingest_chunk_ratio)
     body = "x" * 200  # 200 chars → 4 chunks
     client = _make_client(_analysis_json())
     result = _analyze_body(body, [], "long.md", client, config2)
@@ -549,7 +549,8 @@ def test_analyze_body_parallel_mode(vault):
     body = "x" * 200
     client = _make_client(_analysis_json(concepts=["A"]))
     result = _analyze_body(body, [], "long.md", client, config2)
-    assert client.generate.call_count == -(-200 // 50)  # same chunk count
+    chunk_size = int(100 * config2.pipeline.ingest_chunk_ratio)
+    assert client.generate.call_count == -(-200 // chunk_size)
     assert isinstance(result, AnalysisResult)
 
 

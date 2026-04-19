@@ -11,8 +11,10 @@ Used by `olw run` and `olw watch`. Handles:
 
 from __future__ import annotations
 
+import os
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
@@ -109,36 +111,94 @@ class PipelineOrchestrator:
         log.info("── Ingest (%d note(s)) ──────────────────────────────────", len(md_paths))
         ingest_durations: list[float] = []
         ingest_total = len(md_paths)
-        for idx, raw_path_str in enumerate(md_paths, 1):
-            step_t0 = time.monotonic()
-            p = Path(raw_path_str)
-            if not p.exists():
-                continue
-            if dry_run:
-                log.info("[dry-run] would ingest: %s", p.name)
-                ingested_paths.append(raw_path_str)
-                report.ingested += 1
-                if on_progress:
-                    eta = None
-                    if idx < ingest_total:
-                        eta = float(ingest_total - idx)
-                    on_progress("ingest", idx, ingest_total, eta, p.name)
-                continue
-            try:
-                result = ingest_note(path=p, config=config, client=client, db=db)
-                if result is not None:
-                    report.ingested += 1
+        # Snapshot concept names once per ingest run to avoid repeated full-table scans.
+        existing_topics = db.list_all_concept_names()
+        if dry_run or ingest_total <= 1:
+            for idx, raw_path_str in enumerate(md_paths, 1):
+                step_t0 = time.monotonic()
+                p = Path(raw_path_str)
+                if not p.exists():
+                    continue
+                if dry_run:
+                    log.info("[dry-run] would ingest: %s", p.name)
                     ingested_paths.append(raw_path_str)
-            except Exception as e:
-                log.error("Ingest failed for %s: %s", p.name, e)
-            finally:
-                ingest_durations.append(time.monotonic() - step_t0)
-                if on_progress and ingest_total:
-                    eta = None
-                    if idx < ingest_total:
-                        avg = sum(ingest_durations) / len(ingest_durations)
-                        eta = avg * (ingest_total - idx)
-                    on_progress("ingest", idx, ingest_total, eta, p.name)
+                    report.ingested += 1
+                    if on_progress:
+                        eta = None
+                        if idx < ingest_total:
+                            eta = float(ingest_total - idx)
+                        on_progress("ingest", idx, ingest_total, eta, p.name)
+                    continue
+                try:
+                    result = ingest_note(
+                        path=p,
+                        config=config,
+                        client=client,
+                        db=db,
+                        existing_topics=existing_topics,
+                    )
+                    if result is not None:
+                        report.ingested += 1
+                        ingested_paths.append(raw_path_str)
+                except Exception as e:
+                    log.error("Ingest failed for %s: %s", p.name, e)
+                finally:
+                    ingest_durations.append(time.monotonic() - step_t0)
+                    if on_progress and ingest_total:
+                        eta = None
+                        if idx < ingest_total:
+                            avg = sum(ingest_durations) / len(ingest_durations)
+                            eta = avg * (ingest_total - idx)
+                        on_progress("ingest", idx, ingest_total, eta, p.name)
+        else:
+            env_parallel = os.getenv("OLLAMA_NUM_PARALLEL", "").strip()
+            try:
+                configured_workers = int(env_parallel) if env_parallel else 0
+            except ValueError:
+                configured_workers = 0
+            if configured_workers <= 0:
+                configured_workers = 4
+            max_workers = max(1, min(ingest_total, configured_workers))
+
+            def _ingest_one(raw_path_str: str) -> tuple[str, str, bool, float]:
+                step_t0 = time.monotonic()
+                p = Path(raw_path_str)
+                if not p.exists():
+                    return raw_path_str, p.name, False, time.monotonic() - step_t0
+
+                worker_db = StateDB(config.state_db_path)
+                try:
+                    result = ingest_note(
+                        path=p,
+                        config=config,
+                        client=client,
+                        db=worker_db,
+                        existing_topics=existing_topics,
+                    )
+                    return raw_path_str, p.name, result is not None, time.monotonic() - step_t0
+                except Exception as e:
+                    log.error("Ingest failed for %s: %s", p.name, e)
+                    return raw_path_str, p.name, False, time.monotonic() - step_t0
+                finally:
+                    worker_db.close()
+
+            completed = 0
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = [executor.submit(_ingest_one, raw_path_str) for raw_path_str in md_paths]
+                for future in as_completed(futures):
+                    raw_path_str, note_name, success, duration_s = future.result()
+                    completed += 1
+                    ingest_durations.append(duration_s)
+                    if success:
+                        report.ingested += 1
+                        ingested_paths.append(raw_path_str)
+
+                    if on_progress and ingest_total:
+                        eta = None
+                        if completed < ingest_total:
+                            avg = sum(ingest_durations) / len(ingest_durations)
+                            eta = avg * (ingest_total - completed)
+                        on_progress("ingest", completed, ingest_total, eta, note_name)
 
         report.timings["ingest"] = time.monotonic() - t0
 

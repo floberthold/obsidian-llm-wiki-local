@@ -192,6 +192,23 @@ def test_orchestrator_run_emits_progress_callbacks(config, db):
     assert any(u[0] == "compile_r1" for u in updates)
 
 
+def test_orchestrator_passes_existing_topics_snapshot_to_ingest(config, db):
+    (config.vault / "raw" / "note.md").write_text("---\ntitle: Note\n---\nBody")
+    db.upsert_raw(RawNoteRecord(path="raw/seed.md", content_hash="h1", status="ingested"))
+    db.upsert_concepts("raw/seed.md", ["Seed Concept"])
+
+    with patch("obsidian_llm_wiki.pipeline.ingest.ingest_note", return_value=object()) as mock_ingest:
+        with patch("obsidian_llm_wiki.pipeline.orchestrator._run_compile") as mock_compile:
+            mock_compile.return_value = ([], [], {})
+            orch = PipelineOrchestrator(config, make_mock_client(), db)
+            orch.run(paths=[str(config.vault / "raw" / "note.md")])
+
+    assert mock_ingest.call_count == 1
+    existing_topics = mock_ingest.call_args.kwargs.get("existing_topics")
+    assert existing_topics is not None
+    assert "Seed Concept" in existing_topics
+
+
 def test_orchestrator_run_rounds_default_one(config, db):
     """No transient failures → only one compile round."""
     with patch("obsidian_llm_wiki.pipeline.orchestrator._run_compile") as mock_compile:

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import re
 import time
 from datetime import datetime
@@ -133,8 +134,9 @@ def _analyze_body(
     client: LLMClientProtocol,
     config: Config,
 ) -> AnalysisResult:
-    """Analyze note body, splitting into chunks if body exceeds fast_ctx // 2 chars."""
-    chunk_size = config.effective_provider.fast_ctx // 2
+    """Analyze note body, splitting into chunks when body exceeds configured chunk size."""
+    ratio = max(0.25, min(config.pipeline.ingest_chunk_ratio, 0.9))
+    chunk_size = max(1, int(config.effective_provider.fast_ctx * ratio))
 
     if len(body) <= chunk_size:
         prompt = _build_analysis_prompt(body, existing_concepts, path_name)
@@ -145,6 +147,7 @@ def _analyze_body(
             model=config.models.fast,
             system=_SYSTEM,
             num_ctx=config.effective_provider.fast_ctx,
+            max_retries=config.pipeline.ingest_max_retries,
             telemetry_config=config,
             telemetry_stage="ingest_analysis",
         )
@@ -171,6 +174,7 @@ def _analyze_body(
             model=config.models.fast,
             system=_SYSTEM,
             num_ctx=config.effective_provider.fast_ctx,
+            max_retries=config.pipeline.ingest_max_retries,
             telemetry_config=config,
             telemetry_stage="ingest_analysis_chunk",
         )
@@ -180,8 +184,17 @@ def _analyze_body(
     if config.pipeline.ingest_parallel:
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
+        env_parallel = os.getenv("OLLAMA_NUM_PARALLEL", "").strip()
+        try:
+            configured_workers = int(env_parallel) if env_parallel else 0
+        except ValueError:
+            configured_workers = 0
+        if configured_workers <= 0:
+            configured_workers = 4
+
+        max_workers = max(1, min(len(chunks), configured_workers))
         chunk_results: list[AnalysisResult | None] = [None] * len(chunks)
-        with ThreadPoolExecutor(max_workers=len(chunks)) as executor:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {
                 executor.submit(_analyze_chunk, chunk, i): i for i, chunk in enumerate(chunks)
             }

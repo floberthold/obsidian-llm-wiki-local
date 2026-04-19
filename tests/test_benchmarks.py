@@ -90,8 +90,9 @@ def test_bench_prompt_build_short(benchmark):
 
 
 def test_bench_prompt_build_chunk_size(benchmark, config):
-    """Prompt build at exactly fast_ctx // 2 chars (single-chunk boundary)."""
-    body = "x " * (config.ollama.fast_ctx // 4)  # chars, not tokens
+    """Prompt build near configured single-chunk boundary."""
+    chunk_size = int(config.ollama.fast_ctx * config.pipeline.ingest_chunk_ratio)
+    body = "x " * (chunk_size // 2)  # chars, not tokens
     concepts = [f"Concept {i}" for i in range(30)]
     benchmark(_build_analysis_prompt, body, concepts, "note.md")
 
@@ -100,9 +101,9 @@ def test_bench_prompt_build_chunk_size(benchmark, config):
 
 
 def test_bench_chunk_split_25k(benchmark, config):
-    """Split a 25K note into chunks of fast_ctx // 2."""
+    """Split a 25K note into chunks using ingest_chunk_ratio."""
     body = "word " * 5000  # ~25K chars
-    chunk_size = config.ollama.fast_ctx // 2
+    chunk_size = int(config.ollama.fast_ctx * config.pipeline.ingest_chunk_ratio)
 
     def split():
         return [body[i : i + chunk_size] for i in range(0, len(body), chunk_size)]
@@ -112,7 +113,7 @@ def test_bench_chunk_split_25k(benchmark, config):
 
 def test_bench_chunk_split_100k(benchmark, config):
     body = "word " * 20000  # ~100K chars
-    chunk_size = config.ollama.fast_ctx // 2
+    chunk_size = int(config.ollama.fast_ctx * config.pipeline.ingest_chunk_ratio)
 
     def split():
         return [body[i : i + chunk_size] for i in range(0, len(body), chunk_size)]

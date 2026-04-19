@@ -164,6 +164,8 @@ def request_structured(
     num_ctx: int = 8192,
     num_predict: int = -1,
     max_retries: int = 2,
+    retry_backoff_base_s: float = 0.5,
+    retry_backoff_max_s: float = 8.0,
     telemetry_config=None,
     telemetry_stage: str = "",
 ) -> T:
@@ -281,6 +283,9 @@ def request_structured(
         )
 
         if attempt < max_retries:
+            backoff_s = min(retry_backoff_base_s * (2**attempt), retry_backoff_max_s)
+            if backoff_s > 0:
+                time.sleep(backoff_s)
             current_prompt = (
                 f"Your previous response was invalid.\n"
                 f"Error: {last_error}\n\n"

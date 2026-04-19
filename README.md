@@ -360,6 +360,8 @@ auto_maintain = false            # true = run maintain checks after each compile
 max_concepts_per_source = 8      # limit concepts extracted per note
 watch_debounce = 3.0             # seconds after last file event before processing
 ingest_parallel = false          # true = parallel chunk analysis (needs OLLAMA_NUM_PARALLEL>=4)
+ingest_chunk_ratio = 0.75        # chunk size = fast_ctx * ratio (higher = fewer LLM calls)
+ingest_max_retries = 1           # retries per ingest analysis request
 # language = "en"               # ISO 639-1 output language; autodetects from notes if unset
 ```
 
@@ -375,7 +377,7 @@ ingest_parallel = false          # true = parallel chunk analysis (needs OLLAMA_
 | 16 GB | `32768` | ~16K chars | Default |
 | 32 GB+ | `65536` | ~32K chars | Rich multi-source articles |
 
-`fast_ctx` controls ingest analysis. Notes longer than `fast_ctx / 2` chars are automatically split into chunks and analyzed in sequence — all content is covered, no truncation.
+`fast_ctx` controls ingest analysis. Notes longer than `fast_ctx * ingest_chunk_ratio` chars are automatically split into chunks and analyzed in sequence — all content is covered, no truncation.
 
 | VRAM | Recommended `fast_ctx` | Notes per chunk |
 |---|---|---|
@@ -390,6 +392,8 @@ For vaults with many long notes (>8K chars), enable parallel chunk analysis:
 ```toml
 [pipeline]
 ingest_parallel = true   # requires OLLAMA_NUM_PARALLEL>=4
+ingest_chunk_ratio = 0.75
+ingest_max_retries = 1
 ```
 
 Also set in your shell before starting Ollama:
