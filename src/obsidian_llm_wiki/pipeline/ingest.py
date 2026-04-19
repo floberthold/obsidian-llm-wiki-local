@@ -406,9 +406,9 @@ def _create_source_summary_page(
     """
     # Derive title from note frontmatter > file stem
     title = src_meta.get("title") or path.stem.replace("-", " ").title()
-    safe_name = sanitize_filename(title)
-    out_path = config.sources_dir / f"{safe_name}.md"
-    config.sources_dir.mkdir(parents=True, exist_ok=True)
+    # Mirror the raw folder hierarchy: raw/subdir/note.md -> sources/subdir/note.md
+    out_path = config.sources_dir / path.relative_to(config.raw_dir)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
 
     now = datetime.now().strftime("%Y-%m-%d")
     rel_raw = path.relative_to(config.vault).as_posix()

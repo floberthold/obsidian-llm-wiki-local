@@ -287,6 +287,18 @@ def test_ingest_note_creates_source_summary_page(vault, config, db):
     assert sources, "Source summary page should be created"
 
 
+def test_source_page_mirrors_raw_subfolder_structure(vault, config, db):
+    """Source page for raw/docs/subdir/page.md must land at wiki/sources/docs/subdir/page.md."""
+    subdir = vault / "raw" / "docs" / "subdir"
+    subdir.mkdir(parents=True, exist_ok=True)
+    path = subdir / "page.md"
+    path.write_text("# Page\n\nContent.", encoding="utf-8")
+    client = _make_client(_analysis_json(concepts=["Content"]))
+    ingest_note(path, config, client, db)
+    expected = vault / "wiki" / "sources" / "docs" / "subdir" / "page.md"
+    assert expected.exists(), f"Expected source summary at {expected}"
+
+
 def test_source_page_yaml_with_colon_title(vault, config, db):
     """Source page title containing ':' must not break YAML parsing."""
     # Raw note uses quoted title (valid YAML) — the colon in title flows to source page
