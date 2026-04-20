@@ -174,15 +174,30 @@ class PipelineOrchestrator:
                 ingest_total,
             )
 
+            def _worker_index(worker_name: str) -> int:
+                parts = worker_name.split("_")
+                if len(parts) >= 2:
+                    try:
+                        return int(parts[-1])
+                    except ValueError:
+                        pass
+                return 0
+
+            def _make_lane(worker_name: str) -> str:
+                idx = _worker_index(worker_name)
+                cells = [f"W{i:02d}" if i == idx else "   " for i in range(max_workers)]
+                return "|" + "|".join(cells) + "|"
+
             def _ingest_one(raw_path_str: str) -> tuple[str, str, bool, float]:
                 step_t0 = time.monotonic()
                 p = Path(raw_path_str)
                 worker_name = threading.current_thread().name
+                lane = _make_lane(worker_name)
                 if not p.exists():
-                    log.info("[%s] SKIP missing %s", worker_name, p.name)
+                    log.info("%s SKIP missing %s", lane, p.name)
                     return raw_path_str, p.name, False, time.monotonic() - step_t0
 
-                log.info("[%s] START %s", worker_name, p.name)
+                log.info("%s START %s", lane, p.name)
 
                 worker_db = StateDB(config.state_db_path)
                 try:
@@ -195,14 +210,14 @@ class PipelineOrchestrator:
                     )
                     elapsed = time.monotonic() - step_t0
                     if result is not None:
-                        log.info("[%s] DONE ingest %s (%.1fs)", worker_name, p.name, elapsed)
+                        log.info("%s DONE ingest %s (%.1fs)", lane, p.name, elapsed)
                     else:
-                        log.info("[%s] DONE skip %s (%.1fs)", worker_name, p.name, elapsed)
+                        log.info("%s DONE skip  %s (%.1fs)", lane, p.name, elapsed)
                     return raw_path_str, p.name, result is not None, elapsed
                 except Exception as e:
                     log.error("Ingest failed for %s: %s", p.name, e)
                     elapsed = time.monotonic() - step_t0
-                    log.info("[%s] DONE failed %s (%.1fs)", worker_name, p.name, elapsed)
+                    log.info("%s DONE FAIL  %s (%.1fs)", lane, p.name, elapsed)
                     return raw_path_str, p.name, False, elapsed
                 finally:
                     worker_db.close()
