@@ -11,6 +11,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from obsidian_llm_wiki.config import Config
 from obsidian_llm_wiki.models import AnalysisResult, CompilePlan, SingleArticle
 from obsidian_llm_wiki.ollama_client import OllamaClient
 from obsidian_llm_wiki.structured_output import StructuredOutputError, request_structured
@@ -134,6 +135,38 @@ def test_exhausted_retries_raises():
         )
 
 
+def test_retry_backoff_sleep_applied(monkeypatch, fixtures_dir):
+    valid = (fixtures_dir / "analysis_valid.json").read_text()
+    call_count = 0
+
+    def side_effect(**kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return "not json"
+        return valid
+
+    c = MagicMock(spec=OllamaClient)
+    c.generate.side_effect = lambda **kwargs: side_effect(**kwargs)
+    sleeps: list[float] = []
+
+    monkeypatch.setattr("obsidian_llm_wiki.structured_output.time.sleep", sleeps.append)
+
+    result = request_structured(
+        client=c,
+        prompt="analyze",
+        model_class=AnalysisResult,
+        model="gemma4:e4b",
+        max_retries=2,
+        retry_backoff_base_s=0.25,
+        retry_backoff_max_s=2.0,
+    )
+
+    assert result.quality == "high"
+    assert call_count == 2
+    assert sleeps == [0.25]
+
+
 def test_schema_validation_failure():
     # Valid JSON but wrong schema (missing required fields)
     bad = json.dumps({"wrong_field": "value"})
@@ -157,6 +190,20 @@ def test_single_article_sanitizes_tags():
     # Original dirty values gone
     assert "bad tag" not in article.tags
     assert "C++" not in article.tags
+
+
+def test_analysis_result_coerces_string_concepts():
+    """LLMs often return concepts as plain strings; validator must coerce to Concept objects."""
+    result = AnalysisResult(
+        summary="A note about SAP.",
+        concepts=["SAP Process Mining", "Technical Configuration"],  # type: ignore[list-item]
+        suggested_topics=[],
+        quality="high",
+    )
+    assert len(result.concepts) == 2
+    assert result.concepts[0].name == "SAP Process Mining"
+    assert result.concepts[1].name == "Technical Configuration"
+    assert result.concepts[0].aliases == []
 
 
 def test_num_predict_passed_to_generate():
@@ -221,3 +268,31 @@ def test_single_article_missing_required_field():
             model="qwen2.5:14b",
             max_retries=0,
         )
+
+
+def test_request_structured_writes_telemetry_jsonl(tmp_path):
+    raw = json.dumps({"title": "T", "content": "body", "tags": ["t"]})
+    c = _client(raw)
+    cfg = Config(vault=tmp_path)
+
+    result = request_structured(
+        client=c,
+        prompt="write",
+        model_class=SingleArticle,
+        model="qwen2.5:14b",
+        telemetry_config=cfg,
+        telemetry_stage="unit_test_stage",
+    )
+
+    assert result.title == "T"
+    metrics_path = tmp_path / ".olw" / "metrics.jsonl"
+    assert metrics_path.exists()
+
+    lines = metrics_path.read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) >= 1
+    payload = json.loads(lines[-1])
+    assert payload["event_type"] == "llm_request"
+    assert payload["function_name"] == "request_structured"
+    assert payload["stage"] == "unit_test_stage"
+    assert payload["model"] == "qwen2.5:14b"
+    assert payload["success"] is True

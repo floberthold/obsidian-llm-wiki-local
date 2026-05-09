@@ -90,6 +90,70 @@ ollama pull qwen2.5:14b     # heavy model — article writing (optional, 7B+ rec
 
 > **Minimal setup:** pull only `gemma4:e4b` and set both `fast` and `heavy` to it in the wizard.
 
+### 2b. CMD parallel
+
+Use this in cmd:
+
+set OLLAMA_NUM_PARALLEL=8
+
+    ollama serve
+
+Or one line:
+
+    set OLLAMA_NUM_PARALLEL=8 && setx OLLAMA_NUM_THREADS 12 && ollama serve
+
+Then in a second cmd window (for the pipeline):
+
+    set OLLAMA_NUM_PARALLEL=8 && setx OLLAMA_NUM_THREADS 12 && python -m obsidian_llm_wiki.cli run
+
+Or: 
+
+    set OLLAMA_NUM_PARALLEL=8 && olw run
+
+### 2c. Windows startup guide (parallel CPU setup)
+
+Use this once to configure Ollama for higher CPU throughput on Windows.
+
+1. Set persistent environment variables in `cmd`:
+
+```cmd
+setx OLLAMA_NUM_PARALLEL 8
+setx OLLAMA_NUM_THREADS 12
+```
+
+2. Restart Ollama (required after `setx`):
+
+```cmd
+taskkill /IM "ollama app.exe" /F
+taskkill /IM ollama.exe /F
+start "" "C:\Users\%USERNAME%\AppData\Local\Programs\Ollama\ollama app.exe"
+```
+
+3. Open a new `cmd` window and verify values:
+
+```cmd
+echo %OLLAMA_NUM_PARALLEL%
+echo %OLLAMA_NUM_THREADS%
+```
+
+4. In your vault `wiki.toml`, reduce fast-tier context for better parallel scaling:
+
+```toml
+[ollama]
+fast_ctx = 4096
+```
+
+5. Run the pipeline:
+
+```cmd
+olw run
+```
+
+Notes:
+- `setx` updates future processes only; your current terminal keeps old values.
+- If you see `bind: Only one usage of each socket address`, Ollama is already running. Do not start a second `ollama serve`.
+- Start with `OLLAMA_NUM_PARALLEL=8`; if the system becomes unstable, lower to `6`.
+
 ### 3. Run the setup wizard
 
 ```bash
@@ -230,6 +294,35 @@ Leave `language` unset (the default) to let auto-detection drive it per concept.
 
 ---
 
+## Performance telemetry
+
+`olw` now records timing telemetry for both:
+
+1. Top-level pipeline functions (`ingest_note`, `compile_concepts`, `run_query`, `approve_drafts`)
+2. Per-request LLM calls (`request_structured`, including retries and parse tier)
+
+Telemetry is enabled by default and written as append-only JSONL:
+
+```toml
+[pipeline]
+telemetry_enabled = true
+telemetry_jsonl_path = ".olw/metrics.jsonl"
+```
+
+Each JSON line includes machine-readable fields such as:
+
+- `event_type`
+- `function_name`
+- `stage`
+- `model`
+- `success`
+- `duration_ms`
+- `retry_attempt`, `max_retries`, `parse_tier` (for LLM request events)
+
+This makes it easy to compare fast vs heavy model latency by function over time and decide whether to swap model assignments for better throughput.
+
+---
+
 ## Rejection feedback loop
 
 The core v0.2 feature. When you reject a draft:
@@ -331,6 +424,8 @@ auto_maintain = false            # true = run maintain checks after each compile
 max_concepts_per_source = 8      # limit concepts extracted per note
 watch_debounce = 3.0             # seconds after last file event before processing
 ingest_parallel = false          # true = parallel chunk analysis (needs OLLAMA_NUM_PARALLEL>=4)
+ingest_chunk_ratio = 0.75        # chunk size = fast_ctx * ratio (higher = fewer LLM calls)
+ingest_max_retries = 1           # retries per ingest analysis request
 # language = "en"               # ISO 639-1 output language; autodetects from notes if unset
 ```
 
@@ -346,7 +441,7 @@ ingest_parallel = false          # true = parallel chunk analysis (needs OLLAMA_
 | 16 GB | `32768` | ~16K chars | Default |
 | 32 GB+ | `65536` | ~32K chars | Rich multi-source articles |
 
-`fast_ctx` controls ingest analysis. Notes longer than `fast_ctx / 2` chars are automatically split into chunks and analyzed in sequence — all content is covered, no truncation.
+`fast_ctx` controls ingest analysis. Notes longer than `fast_ctx * ingest_chunk_ratio` chars are automatically split into chunks and analyzed in sequence — all content is covered, no truncation.
 
 | VRAM | Recommended `fast_ctx` | Notes per chunk |
 |---|---|---|
@@ -361,6 +456,8 @@ For vaults with many long notes (>8K chars), enable parallel chunk analysis:
 ```toml
 [pipeline]
 ingest_parallel = true   # requires OLLAMA_NUM_PARALLEL>=4
+ingest_chunk_ratio = 0.75
+ingest_max_retries = 1
 ```
 
 Also set in your shell before starting Ollama:

@@ -16,9 +16,12 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from typing import TYPE_CHECKING, TypeVar
 
 from pydantic import BaseModel, ValidationError
+
+from .telemetry import emit_event
 
 if TYPE_CHECKING:
     from .protocols import LLMClientProtocol
@@ -161,6 +164,10 @@ def request_structured(
     num_ctx: int = 8192,
     num_predict: int = -1,
     max_retries: int = 2,
+    retry_backoff_base_s: float = 0.5,
+    retry_backoff_max_s: float = 8.0,
+    telemetry_config=None,
+    telemetry_stage: str = "",
 ) -> T:
     """
     Request structured output from an LLM client, parse into Pydantic model.
@@ -184,6 +191,7 @@ def request_structured(
     current_prompt = prompt
 
     for attempt in range(max_retries + 1):
+        attempt_t0 = time.monotonic()
         log.debug("structured_output attempt %d/%d model=%s", attempt + 1, max_retries + 1, model)
 
         # Tier 1: JSON mode
@@ -194,11 +202,30 @@ def request_structured(
             format="json",
             num_ctx=num_ctx,
             num_predict=num_predict,
+            telemetry_config=telemetry_config,
+            telemetry_stage=telemetry_stage or model_class.__name__,
         )
 
         # Try direct parse
         result, parse_err = _try_parse(raw, model_class)
         if result is not None:
+            elapsed_ms = round((time.monotonic() - attempt_t0) * 1000.0, 2)
+            emit_event(
+                telemetry_config,
+                event_type="llm_request",
+                function_name="request_structured",
+                stage=telemetry_stage or model_class.__name__,
+                model=model,
+                success=True,
+                retry_attempt=attempt + 1,
+                max_retries=max_retries + 1,
+                parse_tier="tier1",
+                duration_ms=elapsed_ms,
+                num_ctx=num_ctx,
+                num_predict=num_predict,
+                prompt_chars=len(current_prompt),
+                response_chars=len(raw),
+            )
             return result
         last_error = parse_err
         log.debug("Tier 1 parse failed, trying extraction")
@@ -208,6 +235,23 @@ def request_structured(
         if extracted:
             result, parse_err = _try_parse(extracted, model_class)
             if result is not None:
+                elapsed_ms = round((time.monotonic() - attempt_t0) * 1000.0, 2)
+                emit_event(
+                    telemetry_config,
+                    event_type="llm_request",
+                    function_name="request_structured",
+                    stage=telemetry_stage or model_class.__name__,
+                    model=model,
+                    success=True,
+                    retry_attempt=attempt + 1,
+                    max_retries=max_retries + 1,
+                    parse_tier="tier2",
+                    duration_ms=elapsed_ms,
+                    num_ctx=num_ctx,
+                    num_predict=num_predict,
+                    prompt_chars=len(current_prompt),
+                    response_chars=len(raw),
+                )
                 return result
             if parse_err:
                 last_error = parse_err
@@ -219,7 +263,29 @@ def request_structured(
             raw[:300],
         )
 
+        elapsed_ms = round((time.monotonic() - attempt_t0) * 1000.0, 2)
+        emit_event(
+            telemetry_config,
+            event_type="llm_request",
+            function_name="request_structured",
+            stage=telemetry_stage or model_class.__name__,
+            model=model,
+            success=False,
+            retry_attempt=attempt + 1,
+            max_retries=max_retries + 1,
+            parse_tier="failed",
+            duration_ms=elapsed_ms,
+            num_ctx=num_ctx,
+            num_predict=num_predict,
+            prompt_chars=len(current_prompt),
+            response_chars=len(raw),
+            error_message=last_error,
+        )
+
         if attempt < max_retries:
+            backoff_s = min(retry_backoff_base_s * (2**attempt), retry_backoff_max_s)
+            if backoff_s > 0:
+                time.sleep(backoff_s)
             current_prompt = (
                 f"Your previous response was invalid.\n"
                 f"Error: {last_error}\n\n"

@@ -43,7 +43,7 @@ def generate_index(config: Config, db: StateDB) -> Path:
     # (in case they were created outside of DB tracking)
     source_pages: list[tuple[str, str]] = []  # (title, link_text)
     if config.sources_dir.exists():
-        for md in sorted(config.sources_dir.glob("*.md")):
+        for md in sorted(config.sources_dir.glob("**/*.md")):
             try:
                 meta, _ = parse_note(md)
                 title = meta.get("title", md.stem)

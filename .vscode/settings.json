@@ -1,0 +1,14 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "/^python install\\.py$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "ollama": true,
+        "/^python -m pytest tests/test_orchestrator\\.py -q$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "uv": true
+    }
+}

@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import re
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -17,6 +19,7 @@ from ..models import AnalysisResult, Concept, RawNoteRecord
 from ..protocols import LLMClientProtocol
 from ..state import StateDB
 from ..structured_output import request_structured
+from ..telemetry import emit_event
 from ..vault import (
     chunk_text,
     generate_aliases,
@@ -38,6 +41,18 @@ _SYSTEM = (
 
 def _content_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _read_text_with_fallback(path: Path) -> str:
+    """Read text files with practical encoding fallbacks for user-authored notes."""
+    raw = path.read_bytes()
+    for enc in ("utf-8", "utf-8-sig", "cp1252", "latin-1"):
+        try:
+            return raw.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    # Latin-1 should always succeed, but keep a final safe guard.
+    return raw.decode("utf-8", errors="replace")
 
 
 def _build_analysis_prompt(
@@ -119,8 +134,9 @@ def _analyze_body(
     client: LLMClientProtocol,
     config: Config,
 ) -> AnalysisResult:
-    """Analyze note body, splitting into chunks if body exceeds fast_ctx // 2 chars."""
-    chunk_size = config.effective_provider.fast_ctx // 2
+    """Analyze note body, splitting into chunks when body exceeds configured chunk size."""
+    ratio = max(0.25, min(config.pipeline.ingest_chunk_ratio, 0.9))
+    chunk_size = max(1, int(config.effective_provider.fast_ctx * ratio))
 
     if len(body) <= chunk_size:
         prompt = _build_analysis_prompt(body, existing_concepts, path_name)
@@ -131,6 +147,9 @@ def _analyze_body(
             model=config.models.fast,
             system=_SYSTEM,
             num_ctx=config.effective_provider.fast_ctx,
+            max_retries=config.pipeline.ingest_max_retries,
+            telemetry_config=config,
+            telemetry_stage="ingest_analysis",
         )
 
     # Split into chunks — no overlap needed for concept extraction
@@ -144,8 +163,6 @@ def _analyze_body(
     )
 
     def _analyze_chunk(chunk: str, idx: int) -> AnalysisResult:
-        import time
-
         label = f"[part {idx + 1}/{len(chunks)}]"
         log.info("Analyzing %s %s …", path_name or "note", label)
         t0 = time.monotonic()
@@ -157,6 +174,9 @@ def _analyze_body(
             model=config.models.fast,
             system=_SYSTEM,
             num_ctx=config.effective_provider.fast_ctx,
+            max_retries=config.pipeline.ingest_max_retries,
+            telemetry_config=config,
+            telemetry_stage="ingest_analysis_chunk",
         )
         log.info("Analyzed %s %s (%.1fs)", path_name or "note", label, time.monotonic() - t0)
         return result
@@ -164,8 +184,17 @@ def _analyze_body(
     if config.pipeline.ingest_parallel:
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
+        env_parallel = os.getenv("OLLAMA_NUM_PARALLEL", "").strip()
+        try:
+            configured_workers = int(env_parallel) if env_parallel else 0
+        except ValueError:
+            configured_workers = 0
+        if configured_workers <= 0:
+            configured_workers = 4
+
+        max_workers = max(1, min(len(chunks), configured_workers))
         chunk_results: list[AnalysisResult | None] = [None] * len(chunks)
-        with ThreadPoolExecutor(max_workers=len(chunks)) as executor:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {
                 executor.submit(_analyze_chunk, chunk, i): i for i, chunk in enumerate(chunks)
             }
@@ -207,6 +236,51 @@ _STOPWORDS = frozenset(
     }
 )
 
+_CONCEPT_JUNK_RE = re.compile(
+    r"^(?:page|p\.?|figure|fig|section|sec|chapter|ch|slide)\s*[-:#.]?\s*\d+(?:\.\d+)*\b",
+    re.IGNORECASE,
+)
+
+_SINGULAR_EXCEPTIONS = frozenset({"analysis", "news", "series", "species", "status"})
+
+
+def _is_valid_concept_name(name: str) -> bool:
+    """Drop obviously low-information concepts like page/figure labels."""
+    stripped = name.strip()
+    if not stripped:
+        return False
+    if _CONCEPT_JUNK_RE.match(stripped):
+        return False
+    if re.fullmatch(r"\d+(?:\.\d+)*", stripped):
+        return False
+    return True
+
+
+def _singularize_token(token: str) -> str:
+    """Apply lightweight plural reduction for simple concept deduping."""
+    lower = token.lower()
+    if len(lower) <= 3 or lower in _SINGULAR_EXCEPTIONS:
+        return token
+    if lower.endswith("ies") and len(lower) > 4:
+        return token[:-3] + "y"
+    if lower.endswith("ses") and len(lower) > 4:
+        return token[:-2]
+    if lower.endswith("s") and not lower.endswith(("ss", "us", "is")):
+        return token[:-1]
+    return token
+
+
+def _singularize_phrase(name: str) -> str:
+    words = name.split()
+    if not words:
+        return name
+    words[-1] = _singularize_token(words[-1])
+    return " ".join(words)
+
+
+def _concept_singular_key(name: str) -> str:
+    return re.sub(r"\s+", " ", _singularize_phrase(name).strip()).lower()
+
 
 def _validate_aliases(canonical: str, raw_aliases: list[str]) -> list[str]:
     """Filter LLM-produced aliases: remove too-short, stopwords, self-matches, duplicates."""
@@ -232,17 +306,23 @@ def _normalize_concepts(raw_concepts: list[Concept], db: StateDB) -> list[tuple[
 
     Returns (canonical_name, validated_aliases) pairs.
     """
-    existing = {n.lower(): n for n in db.list_all_concept_names()}
+    existing_names = db.list_all_concept_names()
+    existing = {n.lower(): n for n in existing_names}
+    existing_singular = {_concept_singular_key(n): n for n in existing_names}
     seen: set[str] = set()
     result: list[tuple[str, list[str]]] = []
     for concept in raw_concepts:
         name = concept.name.strip()
-        if not name:
+        if not _is_valid_concept_name(name):
             continue
-        canonical = existing.get(name.lower(), name)
-        if canonical in seen:
+        canonical = existing.get(name.lower()) or existing_singular.get(_concept_singular_key(name))
+        if canonical is None:
+            canonical = name
+
+        canonical_key = _concept_singular_key(canonical)
+        if canonical_key in seen:
             continue
-        seen.add(canonical)
+        seen.add(canonical_key)
         aliases = _validate_aliases(canonical, concept.aliases)
         result.append((canonical, aliases))
     return result
@@ -280,6 +360,104 @@ def _preprocess_web_clip(content: str) -> str:
     return "\n".join(cleaned)
 
 
+def _is_ingest_candidate(path: Path) -> bool:
+    return path.is_file() and "processed" not in path.parts and not path.name.startswith(".")
+
+
+def _page_output_dir(pdf_path: Path) -> Path:
+    return pdf_path.parent / sanitize_filename(pdf_path.stem)
+
+
+def convert_pdf_to_markdown(pdf_path: Path, overwrite: bool = False) -> list[Path]:
+    """Convert a PDF into one markdown file per page inside a sibling folder."""
+    try:
+        from pypdf import PdfReader
+    except Exception as e:
+        log.warning("PDF conversion unavailable for %s: %s", pdf_path.name, e)
+        return []
+
+    output_dir = _page_output_dir(pdf_path)
+    existing_pages = sorted(output_dir.glob("page-*.md")) if output_dir.exists() else []
+    if existing_pages and not overwrite:
+        return existing_pages
+
+    try:
+        reader = PdfReader(str(pdf_path))
+    except Exception as e:
+        log.warning("Failed to read PDF %s: %s", pdf_path.name, e)
+        return []
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    if overwrite:
+        for existing in output_dir.glob("page-*.md"):
+            existing.unlink(missing_ok=True)
+
+    rel_pdf = pdf_path.as_posix()
+    written_paths: list[Path] = []
+    for page_number, page in enumerate(reader.pages, start=1):
+        text = (page.extract_text() or "").strip()
+        if not text:
+            log.debug("Skipping image-only PDF page %d in %s", page_number, pdf_path.name)
+            continue
+
+        out_path = output_dir / f"page-{page_number:03d}.md"
+        write_note(
+            out_path,
+            {
+                "title": f"{pdf_path.stem} - Page {page_number}",
+                "source_pdf": rel_pdf,
+                "source_page": page_number,
+                "tags": ["pdf-page"],
+            },
+            f"## Page {page_number}\n\n{text}\n",
+        )
+        written_paths.append(out_path)
+
+    log.info(
+        "Converted PDF %s into %d markdown page(s) under %s",
+        pdf_path.name,
+        len(written_paths),
+        output_dir.name,
+    )
+    emit_event(
+        config=None,
+        event_type="pdf_converted",
+        source_pdf=pdf_path.name,
+        page_count=len(written_paths),
+    )
+    return written_paths
+
+
+def collect_ingest_paths(config: Config, paths: list[Path] | None = None) -> list[Path]:
+    """Collect markdown paths for ingest, auto-converting PDFs into per-page notes."""
+    if paths is None:
+        candidates = list(config.raw_dir.rglob("*")) if config.raw_dir.exists() else []
+    else:
+        candidates = [Path(path) for path in paths]
+
+    md_paths: list[Path] = []
+    seen: set[str] = set()
+
+    for path in sorted(candidates):
+        if not _is_ingest_candidate(path):
+            continue
+
+        suffix = path.suffix.lower()
+        if suffix == ".pdf":
+            for page_path in convert_pdf_to_markdown(path):
+                key = page_path.resolve().as_posix()
+                if key not in seen:
+                    seen.add(key)
+                    md_paths.append(page_path)
+        elif suffix == ".md":
+            key = path.resolve().as_posix()
+            if key not in seen:
+                seen.add(key)
+                md_paths.append(path)
+
+    return sorted(md_paths)
+
+
 def _collect_media_refs(body: str) -> list[str]:
     """Extract media references from note body for preservation in source pages."""
     refs: list[str] = []
@@ -304,12 +482,12 @@ def _create_source_summary_page(
     """
     # Derive title from note frontmatter > file stem
     title = src_meta.get("title") or path.stem.replace("-", " ").title()
-    safe_name = sanitize_filename(title)
-    out_path = config.sources_dir / f"{safe_name}.md"
-    config.sources_dir.mkdir(parents=True, exist_ok=True)
+    # Mirror the raw folder hierarchy: raw/subdir/note.md -> sources/subdir/note.md
+    out_path = config.sources_dir / path.relative_to(config.raw_dir)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
 
     now = datetime.now().strftime("%Y-%m-%d")
-    rel_raw = str(path.relative_to(config.vault))
+    rel_raw = path.relative_to(config.vault).as_posix()
     source_url = src_meta.get("source") or src_meta.get("url") or ""
     aliases = generate_aliases(title, "")  # source pages rarely have abbreviations
 
@@ -341,7 +519,7 @@ def _create_source_summary_page(
         "",
         "## Source Info",
         f"- **Quality:** {result.quality}",
-        f"- **Raw file:** {rel_raw}",
+        f"- **Raw file:** [[{rel_raw}]]",
         f"- **Ingested:** {now}",
     ]
     if source_url:
@@ -370,32 +548,81 @@ def ingest_note(
 
     Returns AnalysisResult or None if skipped (duplicate / already ingested).
     """
-    content = path.read_text(encoding="utf-8")
-    # Hash body only (strip frontmatter) so copies are detected as duplicates
-    # even after ingest has updated the original's frontmatter (olw_status etc.)
+    fn_t0 = time.monotonic()
     try:
-        _, body_for_hash = parse_note(path)
+        meta, body = parse_note(path)
     except Exception:
-        body_for_hash = content
-    h = _content_hash(body_for_hash)
+        meta, body = {}, _read_text_with_fallback(path)
+
+    # Hash body only (strip frontmatter) so copies are detected as duplicates
+    # even after ingest has updated the original's frontmatter (olw_status etc.).
+    # Exception: when source_pdf is set (PDF-extracted pages), include it in the
+    # hash so pages from *different* PDFs with identical text are not falsely
+    # flagged as duplicates.
+    source_pdf = meta.get("source_pdf", "")
+    body_for_hash = body
+    hash_input = (source_pdf + "\x00" + body_for_hash) if source_pdf else body_for_hash
+    h = _content_hash(hash_input)
 
     # Dedup check
+    rel_path = path.relative_to(config.vault).as_posix()
+
     existing = db.get_raw_by_hash(h)
-    if existing and existing.path != str(path.relative_to(config.vault)):
+    if existing and existing.path != rel_path:
         log.info("Duplicate of %s, skipping %s", existing.path, path.name)
+        emit_event(
+            config,
+            event_type="function_timing",
+            function_name="ingest_note",
+            stage="ingest",
+            model=config.models.fast,
+            success=True,
+            outcome="skipped_duplicate",
+            duration_ms=round((time.monotonic() - fn_t0) * 1000.0, 2),
+            note=path.name,
+        )
         return None
 
-    rel_path = str(path.relative_to(config.vault))
     record = db.get_raw(rel_path)
 
     if record and record.status == "ingested" and not force:
         log.info("Already ingested: %s", path.name)
+        emit_event(
+            config,
+            event_type="function_timing",
+            function_name="ingest_note",
+            stage="ingest",
+            model=config.models.fast,
+            success=True,
+            outcome="skipped_already_ingested",
+            duration_ms=round((time.monotonic() - fn_t0) * 1000.0, 2),
+            note=path.name,
+        )
         return None
 
     # Pre-process web clips
-    meta, body = parse_note(path)
     if meta.get("source") or meta.get("url"):  # web clipper adds these
         body = _preprocess_web_clip(body)
+
+    # Skip notes with no usable content (e.g. image-only PDF pages already on disk)
+    _EMPTY_BODY_MARKERS = (
+        "(No extractable text found on this page. The PDF may be image-only.)",
+    )
+    stripped_body = body.strip()
+    if not stripped_body or stripped_body in _EMPTY_BODY_MARKERS:
+        log.info("Skipping empty/image-only note: %s", path.name)
+        emit_event(
+            config,
+            event_type="function_timing",
+            function_name="ingest_note",
+            stage="ingest",
+            model=config.models.fast,
+            success=True,
+            outcome="skipped_empty",
+            duration_ms=round((time.monotonic() - fn_t0) * 1000.0, 2),
+            note=path.name,
+        )
+        return None
 
     # Chunk + embed only when RAG store is wired in (Phase 2)
     if rag is not None:
@@ -430,6 +657,19 @@ def ingest_note(
                 status="failed",
                 error=str(e),
             )
+        )
+        emit_event(
+            config,
+            event_type="function_timing",
+            function_name="ingest_note",
+            stage="ingest",
+            model=config.models.fast,
+            success=False,
+            outcome="failed",
+            duration_ms=round((time.monotonic() - fn_t0) * 1000.0, 2),
+            note=path.name,
+            error_class=e.__class__.__name__,
+            error_message=str(e),
         )
         return None
 
@@ -467,6 +707,17 @@ def ingest_note(
         result.quality,
         [c.name for c in result.concepts[:3]],
     )
+    emit_event(
+        config,
+        event_type="function_timing",
+        function_name="ingest_note",
+        stage="ingest",
+        model=config.models.fast,
+        success=True,
+        outcome="ingested",
+        duration_ms=round((time.monotonic() - fn_t0) * 1000.0, 2),
+        note=path.name,
+    )
     return result
 
 
@@ -477,12 +728,8 @@ def ingest_all(
     rag=None,
     force: bool = False,
 ) -> list[tuple[Path, AnalysisResult | None]]:
-    """Ingest all .md files in raw/ (excluding raw/processed/ subfolders)."""
-    raw_files = [
-        p
-        for p in config.raw_dir.rglob("*.md")
-        if "processed" not in p.parts and not p.name.startswith(".")
-    ]
+    """Ingest all markdown files in raw/, including per-page PDF conversions."""
+    raw_files = collect_ingest_paths(config)
     # Snapshot concept names once before loop (for consistent prompt context)
     existing_topics = db.list_all_concept_names()
     results = []

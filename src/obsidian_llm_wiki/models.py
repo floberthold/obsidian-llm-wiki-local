@@ -36,6 +36,15 @@ class AnalysisResult(BaseModel):
 
     summary: str = Field(description="2-3 sentence plain-English summary")
     concepts: list[Concept] = Field(description="Main topics/concepts found (max 8)")
+
+    @field_validator("concepts", mode="before")
+    @classmethod
+    def _coerce_concept_strings(cls, v: object) -> object:
+        """Small models often return concepts as plain strings instead of objects.
+        Coerce each string item to {"name": s} so Pydantic can construct a Concept."""
+        if isinstance(v, list):
+            return [{"name": item} if isinstance(item, str) else item for item in v]
+        return v
     suggested_topics: list[str] = Field(
         description="Titles of wiki articles this note should feed into (max 5)"
     )

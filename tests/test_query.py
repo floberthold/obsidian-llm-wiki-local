@@ -172,3 +172,24 @@ def test_query_answer_prompt_has_language_instruction(vault, config, db):
 
     second_call_prompt = client.generate.call_args_list[1].kwargs.get("prompt", "")
     assert "same language as the user's question" in second_call_prompt
+
+
+def test_run_query_writes_telemetry_jsonl(vault, config, db):
+    _write_index(config, "# Wiki Index\n\n## Concepts\n- [[Topic]]\n")
+    _write_concept_page(config, "Topic")
+
+    selection_json = json.dumps({"pages": ["Topic"]})
+    answer_json = json.dumps({"answer": "Answer."})
+    client = _make_client(selection_json, answer_json)
+
+    run_query(config, client, db, "What is Topic?")
+
+    metrics_path = vault / ".olw" / "metrics.jsonl"
+    assert metrics_path.exists()
+
+    lines = metrics_path.read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) >= 3
+    payloads = [json.loads(line) for line in lines]
+    assert any(p.get("function_name") == "run_query" for p in payloads)
+    assert any(p.get("stage") == "query_select_pages" for p in payloads)
+    assert any(p.get("stage") == "query_generate_answer" for p in payloads)

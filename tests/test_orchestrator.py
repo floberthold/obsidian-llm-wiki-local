@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -174,6 +175,100 @@ def test_orchestrator_run_timings_populated(config, db):
     assert "ingest" in report.timings
 
 
+def test_orchestrator_run_emits_progress_callbacks(config, db):
+    raw_file = config.vault / "raw" / "note.md"
+    raw_file.write_text("---\ntitle: Note\n---\nContent.")
+    db.upsert_raw(RawNoteRecord(path="raw/note.md", content_hash="h1", status="ingested"))
+    db.upsert_concepts("raw/note.md", ["Alpha"])
+
+    updates = []
+
+    with patch("obsidian_llm_wiki.pipeline.ingest.ingest_note", return_value=object()):
+        with patch("obsidian_llm_wiki.pipeline.orchestrator._run_compile") as mock_compile:
+            mock_compile.return_value = ([], [], {})
+            orch = PipelineOrchestrator(config, make_mock_client(), db)
+            orch.run(paths=[str(raw_file)], on_progress=lambda *args: updates.append(args))
+
+    assert any(u[0] == "ingest" for u in updates)
+    assert any(u[0] == "compile_r1" for u in updates)
+
+
+def test_orchestrator_passes_existing_topics_snapshot_to_ingest(config, db):
+    (config.vault / "raw" / "note.md").write_text("---\ntitle: Note\n---\nBody")
+    db.upsert_raw(RawNoteRecord(path="raw/seed.md", content_hash="h1", status="ingested"))
+    db.upsert_concepts("raw/seed.md", ["Seed Concept"])
+
+    with patch("obsidian_llm_wiki.pipeline.ingest.ingest_note", return_value=object()) as mock_ingest:
+        with patch("obsidian_llm_wiki.pipeline.orchestrator._run_compile") as mock_compile:
+            mock_compile.return_value = ([], [], {})
+            orch = PipelineOrchestrator(config, make_mock_client(), db)
+            orch.run(paths=[str(config.vault / "raw" / "note.md")])
+
+    assert mock_ingest.call_count == 1
+    existing_topics = mock_ingest.call_args.kwargs.get("existing_topics")
+    assert existing_topics is not None
+    assert "Seed Concept" in existing_topics
+
+
+def test_orchestrator_ingest_eta_fallback_when_all_skipped(config, db, monkeypatch):
+    for name in ["a.md", "b.md"]:
+        (config.vault / "raw" / name).write_text("---\ntitle: Note\n---\nBody")
+
+    monkeypatch.setenv("OLLAMA_NUM_PARALLEL", "1")
+    updates: list[tuple[str, int, int, float | None, str]] = []
+
+    with patch("obsidian_llm_wiki.pipeline.ingest.ingest_note", return_value=None):
+        with patch("obsidian_llm_wiki.pipeline.orchestrator._run_compile") as mock_compile:
+            mock_compile.return_value = ([], [], {})
+            orch = PipelineOrchestrator(config, make_mock_client(), db)
+            orch.run(
+                paths=[str(config.vault / "raw" / "a.md"), str(config.vault / "raw" / "b.md")],
+                on_progress=lambda *args: updates.append(args),
+            )
+
+    ingest_updates = [u for u in updates if u[0] == "ingest"]
+    assert ingest_updates
+    # ETA should still be emitted for non-final progress even if every note is skipped.
+    assert ingest_updates[0][3] is not None
+
+
+def test_orchestrator_ingest_eta_prefers_processed_durations(config, db, monkeypatch):
+    for name in ["a.md", "b.md", "c.md"]:
+        (config.vault / "raw" / name).write_text("---\ntitle: Note\n---\nBody")
+
+    monkeypatch.setenv("OLLAMA_NUM_PARALLEL", "1")
+    updates: list[tuple[str, int, int, float | None, str]] = []
+    call_idx = {"n": 0}
+
+    def fake_ingest_note(**kwargs):
+        call_idx["n"] += 1
+        if call_idx["n"] == 1:
+            return None
+        time.sleep(0.04)
+        return object()
+
+    with patch("obsidian_llm_wiki.pipeline.ingest.ingest_note", side_effect=fake_ingest_note):
+        with patch("obsidian_llm_wiki.pipeline.orchestrator._run_compile") as mock_compile:
+            mock_compile.return_value = ([], [], {})
+            orch = PipelineOrchestrator(config, make_mock_client(), db)
+            report = orch.run(
+                paths=[
+                    str(config.vault / "raw" / "a.md"),
+                    str(config.vault / "raw" / "b.md"),
+                    str(config.vault / "raw" / "c.md"),
+                ],
+                on_progress=lambda *args: updates.append(args),
+            )
+
+    ingest_updates = [u for u in updates if u[0] == "ingest"]
+    assert len(ingest_updates) == 3
+    eta_after_second = ingest_updates[1][3]
+    assert eta_after_second is not None
+    # After one skipped + one processed note, ETA should be anchored on processed timings.
+    assert eta_after_second > 0.025
+    assert report.ingested == 2
+
+
 def test_orchestrator_run_rounds_default_one(config, db):
     """No transient failures → only one compile round."""
     with patch("obsidian_llm_wiki.pipeline.orchestrator._run_compile") as mock_compile:
@@ -220,8 +315,6 @@ def test_orchestrator_llm_output_not_retried(config, db):
 
 def test_orchestrator_selective_recompile_with_absolute_paths(config, db):
     """Absolute paths from watchdog must be normalized to vault-relative before DB lookup."""
-    import json
-
     db.upsert_raw(RawNoteRecord(path="raw/a.md", content_hash="h1", status="ingested"))
     db.upsert_raw(RawNoteRecord(path="raw/b.md", content_hash="h2", status="ingested"))
     db.upsert_concepts("raw/a.md", ["Alpha"])
@@ -230,29 +323,79 @@ def test_orchestrator_selective_recompile_with_absolute_paths(config, db):
     (config.vault / "raw" / "a.md").write_text("---\ntitle: A\n---\nContent about Alpha.")
     (config.vault / "raw" / "b.md").write_text("---\ntitle: B\n---\nContent about Beta.")
 
-    mock_response = json.dumps({"title": "Alpha", "content": "Alpha content.", "tags": []})
-    client = make_mock_client(mock_response)
+    client = make_mock_client()
 
     # Pass absolute path (as watchdog would supply it)
     abs_path = str(config.vault / "raw" / "a.md")
 
-    import obsidian_llm_wiki.pipeline.ingest as ingest_mod
+    with patch("obsidian_llm_wiki.pipeline.ingest.ingest_note", return_value=object()):
+        with patch("obsidian_llm_wiki.pipeline.orchestrator._run_compile") as mock_compile:
+            mock_compile.return_value = ([], [], {})
+            orch = PipelineOrchestrator(config, client, db)
+            orch.run(paths=[abs_path])
 
-    original_ingest = ingest_mod.ingest_note
+    assert mock_compile.call_count == 1
+    assert mock_compile.call_args.kwargs["concepts"] == ["Alpha"]
 
-    def fake_ingest(path, config, client, db):
-        return object()  # truthy — simulates successful ingest
 
-    ingest_mod.ingest_note = fake_ingest
-    try:
-        orch = PipelineOrchestrator(config, client, db)
-        orch.run(paths=[abs_path])
-    finally:
-        ingest_mod.ingest_note = original_ingest
+def test_orchestrator_parallel_ingest_ctrl_c_cancels_futures(config, db, monkeypatch):
+    """KeyboardInterrupt during parallel ingest cancels pending futures immediately."""
+    for name in ["a.md", "b.md"]:
+        (config.vault / "raw" / name).write_text("---\ntitle: Note\n---\nBody")
 
-    # Alpha was the linked concept; Beta should still need compile
-    needing = db.concepts_needing_compile()
-    assert "Beta" in needing
+    monkeypatch.setenv("OLLAMA_NUM_PARALLEL", "4")
+
+    class _FakeFuture:
+        def __init__(self) -> None:
+            self.cancelled = False
+
+        def cancel(self) -> bool:
+            self.cancelled = True
+            return True
+
+    class _FakeExecutor:
+        def __init__(self, max_workers: int) -> None:
+            self.max_workers = max_workers
+            self.futures: list[_FakeFuture] = []
+            self.shutdown_calls: list[tuple[bool, bool]] = []
+
+        def submit(self, fn, raw_path_str):  # noqa: ANN001
+            fut = _FakeFuture()
+            self.futures.append(fut)
+            return fut
+
+        def shutdown(self, wait: bool = True, cancel_futures: bool = False) -> None:
+            self.shutdown_calls.append((wait, cancel_futures))
+
+    fake_executor = _FakeExecutor(max_workers=4)
+
+    def _fake_executor_factory(*, max_workers: int):
+        fake_executor.max_workers = max_workers
+        return fake_executor
+
+    with patch("obsidian_llm_wiki.pipeline.ingest.ingest_note", return_value=object()):
+        with patch(
+            "obsidian_llm_wiki.pipeline.orchestrator.ThreadPoolExecutor",
+            side_effect=_fake_executor_factory,
+        ):
+            with patch(
+                "obsidian_llm_wiki.pipeline.orchestrator.as_completed",
+                side_effect=KeyboardInterrupt,
+            ):
+                with patch("obsidian_llm_wiki.pipeline.orchestrator._run_compile") as mock_compile:
+                    mock_compile.return_value = ([], [], {})
+                    orch = PipelineOrchestrator(config, make_mock_client(), db)
+                    with pytest.raises(KeyboardInterrupt):
+                        orch.run(
+                            paths=[
+                                str(config.vault / "raw" / "a.md"),
+                                str(config.vault / "raw" / "b.md"),
+                            ]
+                        )
+
+    assert fake_executor.shutdown_calls
+    assert fake_executor.shutdown_calls[0] == (False, True)
+    assert all(f.cancelled for f in fake_executor.futures)
 
 
 def test_orchestrator_auto_approve(config, db):
@@ -295,6 +438,34 @@ def test_orchestrator_lint_runs_when_no_drafts_produced(config, db):
         lint_mod.run_lint = original_lint
 
     assert len(lint_called) == 1  # lint ran despite zero new drafts
+
+
+def test_orchestrator_dry_run_converts_pdf_into_page_markdown(config, db, monkeypatch):
+    pdf_path = config.vault / "raw" / "Slides.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4")
+
+    class _FakePage:
+        def __init__(self, text):
+            self._text = text
+
+        def extract_text(self):
+            return self._text
+
+    class _FakeReader:
+        def __init__(self, _path):
+            self.pages = [_FakePage("First"), _FakePage("Second")]
+
+    import sys
+    import types
+
+    monkeypatch.setitem(sys.modules, "pypdf", types.SimpleNamespace(PdfReader=_FakeReader))
+
+    orch = PipelineOrchestrator(config, make_mock_client(), db)
+    report = orch.run(paths=[str(pdf_path)], dry_run=True)
+
+    assert report.ingested == 2
+    assert (config.vault / "raw" / "Slides" / "page-001.md").exists()
+    assert (config.vault / "raw" / "Slides" / "page-002.md").exists()
 
 
 def test_orchestrator_ingest_exception_logged_not_raised(config, db):

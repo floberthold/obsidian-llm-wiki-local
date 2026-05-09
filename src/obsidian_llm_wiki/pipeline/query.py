@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
+import time
 
 from ..config import Config
 from ..indexer import append_log, generate_index
@@ -20,6 +21,7 @@ from ..models import PageSelection, QueryAnswer
 from ..protocols import LLMClientProtocol
 from ..state import StateDB
 from ..structured_output import request_structured
+from ..telemetry import emit_event
 from ..vault import parse_note, sanitize_filename, write_note
 
 MAX_PAGES = 5
@@ -94,8 +96,19 @@ def run_query(
     Run a query against the wiki.
     Returns (answer_markdown, selected_page_titles).
     """
+    fn_t0 = time.monotonic()
     index_content = _load_index(config)
     if not index_content:
+        emit_event(
+            config,
+            event_type="function_timing",
+            function_name="run_query",
+            stage="query",
+            model="mixed",
+            success=True,
+            outcome="no_index",
+            duration_ms=round((time.monotonic() - fn_t0) * 1000.0, 2),
+        )
         return (
             "No wiki index found. Run `olw ingest` and `olw compile` first.",
             [],
@@ -116,6 +129,8 @@ def run_query(
         model=config.models.fast,
         num_ctx=config.effective_provider.fast_ctx,
         max_retries=2,
+        telemetry_config=config,
+        telemetry_stage="query_select_pages",
     )
 
     # Step 2: load selected pages
@@ -139,11 +154,24 @@ def run_query(
         model=config.models.heavy,
         num_ctx=config.effective_provider.heavy_ctx,
         max_retries=2,
+        telemetry_config=config,
+        telemetry_stage="query_generate_answer",
     )
 
     if save:
         _save_query(config, db, question, result.answer, selection.pages)
 
+    emit_event(
+        config,
+        event_type="function_timing",
+        function_name="run_query",
+        stage="query",
+        model="mixed",
+        success=True,
+        outcome="completed",
+        duration_ms=round((time.monotonic() - fn_t0) * 1000.0, 2),
+        selected_pages=len(selection.pages),
+    )
     return result.answer, selection.pages
 
 

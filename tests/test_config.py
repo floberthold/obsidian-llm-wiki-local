@@ -32,6 +32,18 @@ def test_default_wiki_toml_contains_language_comment():
     assert "ISO 639-1" in toml
 
 
+def test_default_wiki_toml_contains_telemetry_defaults():
+    toml = default_wiki_toml()
+    assert "telemetry_enabled = true" in toml
+    assert 'telemetry_jsonl_path = ".olw/metrics.jsonl"' in toml
+
+
+def test_pipeline_config_telemetry_defaults():
+    cfg = PipelineConfig()
+    assert cfg.telemetry_enabled is True
+    assert cfg.telemetry_jsonl_path == ".olw/metrics.jsonl"
+
+
 def test_pipeline_config_accepts_explicit_language():
     cfg = PipelineConfig(language="de")
     assert cfg.language == "de"

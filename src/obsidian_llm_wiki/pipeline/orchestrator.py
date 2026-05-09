@@ -11,11 +11,15 @@ Used by `olw run` and `olw watch`. Handles:
 
 from __future__ import annotations
 
+import os
 import logging
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
+from typing import Callable
 
 from ..config import Config
 from ..protocols import LLMClientProtocol
@@ -73,6 +77,7 @@ class PipelineOrchestrator:
         fix: bool = False,
         max_rounds: int = 2,
         dry_run: bool = False,
+        on_progress: Callable[[str, int, int, float | None, str], None] | None = None,
     ) -> PipelineReport:
         """
         Run full pipeline: ingest → compile → lint → [stubs] → [approve].
@@ -86,7 +91,7 @@ class PipelineOrchestrator:
         from ..git_ops import git_commit
         from ..indexer import append_log, generate_index
         from ..pipeline.compile import approve_drafts
-        from ..pipeline.ingest import ingest_note
+        from ..pipeline.ingest import collect_ingest_paths, ingest_note
         from ..pipeline.lint import run_lint
         from ..pipeline.maintain import create_stubs
 
@@ -100,29 +105,156 @@ class PipelineOrchestrator:
         ingested_paths: list[str] = []
 
         if paths is not None:
-            md_paths = [p for p in paths if p.endswith(".md")]
+            md_paths = [str(p) for p in collect_ingest_paths(config, [Path(p) for p in paths])]
         else:
-            md_paths = (
-                [str(p) for p in config.raw_dir.rglob("*.md")] if config.raw_dir.exists() else []
-            )
+            md_paths = [str(p) for p in collect_ingest_paths(config)]
 
         log.info("── Ingest (%d note(s)) ──────────────────────────────────", len(md_paths))
-        for raw_path_str in md_paths:
-            p = Path(raw_path_str)
-            if not p.exists():
-                continue
-            if dry_run:
-                log.info("[dry-run] would ingest: %s", p.name)
-                ingested_paths.append(raw_path_str)
-                report.ingested += 1
-                continue
-            try:
-                result = ingest_note(path=p, config=config, client=client, db=db)
-                if result is not None:
-                    report.ingested += 1
+        ingest_durations: list[float] = []
+        ingest_processed_durations: list[float] = []
+        ingest_total = len(md_paths)
+        # Snapshot concept names once per ingest run to avoid repeated full-table scans.
+        existing_topics = db.list_all_concept_names()
+        if dry_run or ingest_total <= 1:
+            for idx, raw_path_str in enumerate(md_paths, 1):
+                step_t0 = time.monotonic()
+                p = Path(raw_path_str)
+                processed = False
+                if not p.exists():
+                    continue
+                if dry_run:
+                    log.info("[dry-run] would ingest: %s", p.name)
                     ingested_paths.append(raw_path_str)
-            except Exception as e:
-                log.error("Ingest failed for %s: %s", p.name, e)
+                    report.ingested += 1
+                    if on_progress:
+                        eta = None
+                        if idx < ingest_total:
+                            eta = float(ingest_total - idx)
+                        on_progress("ingest", idx, ingest_total, eta, p.name)
+                    continue
+                try:
+                    result = ingest_note(
+                        path=p,
+                        config=config,
+                        client=client,
+                        db=db,
+                        existing_topics=existing_topics,
+                    )
+                    if result is not None:
+                        processed = True
+                        report.ingested += 1
+                        ingested_paths.append(raw_path_str)
+                except Exception as e:
+                    log.error("Ingest failed for %s: %s", p.name, e)
+                finally:
+                    elapsed = time.monotonic() - step_t0
+                    ingest_durations.append(elapsed)
+                    if processed:
+                        ingest_processed_durations.append(elapsed)
+                    if on_progress and ingest_total:
+                        eta = None
+                        if idx < ingest_total:
+                            basis = ingest_processed_durations or ingest_durations
+                            if basis:
+                                avg = sum(basis) / len(basis)
+                                eta = avg * (ingest_total - idx)
+                        on_progress("ingest", idx, ingest_total, eta, p.name)
+        else:
+            env_parallel = os.getenv("OLLAMA_NUM_PARALLEL", "").strip()
+            try:
+                configured_workers = int(env_parallel) if env_parallel else 0
+            except ValueError:
+                configured_workers = 0
+            if configured_workers <= 0:
+                configured_workers = 4
+            max_workers = max(1, min(ingest_total, configured_workers))
+            log.info(
+                "Parallel ingest enabled: %d worker(s) for %d note(s)",
+                max_workers,
+                ingest_total,
+            )
+
+            def _worker_index(worker_name: str) -> int:
+                parts = worker_name.split("_")
+                if len(parts) >= 2:
+                    try:
+                        return int(parts[-1])
+                    except ValueError:
+                        pass
+                return 0
+
+            def _make_lane(worker_name: str) -> str:
+                idx = _worker_index(worker_name)
+                cells = [f"W{i:02d}" if i == idx else "   " for i in range(max_workers)]
+                return "|" + "|".join(cells) + "|"
+
+            def _ingest_one(raw_path_str: str) -> tuple[str, str, bool, float]:
+                step_t0 = time.monotonic()
+                p = Path(raw_path_str)
+                worker_name = threading.current_thread().name
+                lane = _make_lane(worker_name)
+                if not p.exists():
+                    log.info("%s SKIP missing %s", lane, p.name)
+                    return raw_path_str, p.name, False, time.monotonic() - step_t0
+
+                log.info("%s START %s", lane, p.name)
+
+                worker_db = StateDB(config.state_db_path)
+                try:
+                    result = ingest_note(
+                        path=p,
+                        config=config,
+                        client=client,
+                        db=worker_db,
+                        existing_topics=existing_topics,
+                    )
+                    elapsed = time.monotonic() - step_t0
+                    if result is not None:
+                        log.info("%s DONE ingest %s (%.1fs)", lane, p.name, elapsed)
+                    else:
+                        log.info("%s DONE skip  %s (%.1fs)", lane, p.name, elapsed)
+                    return raw_path_str, p.name, result is not None, elapsed
+                except Exception as e:
+                    log.error("Ingest failed for %s: %s", p.name, e)
+                    elapsed = time.monotonic() - step_t0
+                    log.info("%s DONE FAIL  %s (%.1fs)", lane, p.name, elapsed)
+                    return raw_path_str, p.name, False, elapsed
+                finally:
+                    worker_db.close()
+
+            completed = 0
+            executor = ThreadPoolExecutor(max_workers=max_workers)
+            interrupted = False
+            futures = []
+            try:
+                futures = [executor.submit(_ingest_one, raw_path_str) for raw_path_str in md_paths]
+                for future in as_completed(futures):
+                    raw_path_str, note_name, success, duration_s = future.result()
+                    completed += 1
+                    ingest_durations.append(duration_s)
+                    if success:
+                        ingest_processed_durations.append(duration_s)
+                        report.ingested += 1
+                        ingested_paths.append(raw_path_str)
+
+                    if on_progress and ingest_total:
+                        eta = None
+                        if completed < ingest_total:
+                            basis = ingest_processed_durations or ingest_durations
+                            if basis:
+                                avg = sum(basis) / len(basis)
+                                eta = avg * (ingest_total - completed)
+                        on_progress("ingest", completed, ingest_total, eta, note_name)
+            except KeyboardInterrupt:
+                interrupted = True
+                # Avoid waiting for all worker threads when user cancels.
+                for future in futures:
+                    future.cancel()
+                executor.shutdown(wait=False, cancel_futures=True)
+                raise
+            finally:
+                if not interrupted:
+                    executor.shutdown(wait=True)
 
         report.timings["ingest"] = time.monotonic() - t0
 
@@ -138,17 +270,29 @@ class PipelineOrchestrator:
             relative_ingested = []
             for p_str in ingested_paths:
                 try:
-                    relative_ingested.append(str(Path(p_str).relative_to(config.vault)))
+                    relative_ingested.append(Path(p_str).relative_to(config.vault).as_posix())
                 except ValueError:
-                    relative_ingested.append(p_str)  # already relative
+                    relative_ingested.append(Path(p_str).as_posix())  # already relative
             priority_concepts = db.get_concepts_for_sources(relative_ingested) or None
 
         n_concepts = len(priority_concepts) if priority_concepts else "all"
         log.info("── Compile round 1 (%s concept(s)) ─────────────────────────", n_concepts)
         t1 = time.monotonic()
+
+        def _on_round1_progress(completed: int, total: int, name: str, eta: float | None) -> None:
+            if on_progress:
+                on_progress("compile_r1", completed, total, eta, name)
+
         draft_paths, round1_failed, r1_timings = _run_compile(
-            config, client, db, concepts=priority_concepts, dry_run=dry_run
+            config,
+            client,
+            db,
+            concepts=priority_concepts,
+            dry_run=dry_run,
+            on_progress=_on_round1_progress,
         )
+        if on_progress and priority_concepts:
+            on_progress("compile_r1", len(priority_concepts), len(priority_concepts), 0.0, "done")
         report.timings["compile_r1"] = time.monotonic() - t1
         report.compiled += len(draft_paths)
         report.failed.extend(round1_failed)
@@ -172,9 +316,27 @@ class PipelineOrchestrator:
             log.info("── Compile round 2 (%d retries) ────────────────────────────", len(transient))
             transient_concepts = [f.concept for f in transient]
             t2 = time.monotonic()
+
+            def _on_round2_progress(completed: int, total: int, name: str, eta: float | None) -> None:
+                if on_progress:
+                    on_progress("compile_r2", completed, total, eta, name)
+
             r2_drafts, r2_failed, r2_timings = _run_compile(
-                config, client, db, concepts=transient_concepts, dry_run=dry_run
+                config,
+                client,
+                db,
+                concepts=transient_concepts,
+                dry_run=dry_run,
+                on_progress=_on_round2_progress,
             )
+            if on_progress and transient_concepts:
+                on_progress(
+                    "compile_r2",
+                    len(transient_concepts),
+                    len(transient_concepts),
+                    0.0,
+                    "done",
+                )
             report.timings["compile_r2"] = time.monotonic() - t2
             report.compiled += len(r2_drafts)
             draft_paths = draft_paths + r2_drafts
@@ -210,18 +372,32 @@ def _run_compile(
     db: StateDB,
     concepts: list[str] | None,
     dry_run: bool,
+    on_progress: Callable[[int, int, str, float | None], None] | None = None,
 ) -> tuple[list[Path], list[FailureRecord], dict[str, float]]:
     """Run compile_concepts and classify failures by reason."""
     from ..openai_compat_client import LLMBadRequestError, LLMError
     from ..pipeline.compile import compile_concepts
 
     try:
+        compile_t0 = time.monotonic()
+
+        def _on_compile_progress(idx: int, total: int, name: str) -> None:
+            if not on_progress:
+                return
+            completed = max(idx - 1, 0)
+            eta = None
+            if completed > 0 and total > completed:
+                elapsed = time.monotonic() - compile_t0
+                eta = (elapsed / completed) * (total - completed)
+            on_progress(completed, total, name, eta)
+
         draft_paths, failed_names, concept_timings = compile_concepts(
             config=config,
             client=client,
             db=db,
             dry_run=dry_run,
             concepts=concepts,
+            on_progress=_on_compile_progress,
         )
     except LLMBadRequestError as e:
         # Bad request (HTTP 400) — non-retryable; mark all as UNKNOWN not TRANSIENT

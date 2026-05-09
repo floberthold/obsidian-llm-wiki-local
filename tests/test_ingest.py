@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import sys
+import types
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -14,9 +16,12 @@ from obsidian_llm_wiki.pipeline.ingest import (
     _SYSTEM,
     _analyze_body,
     _build_analysis_prompt,
+    _page_output_dir,
     _merge_chunk_results,
     _normalize_concepts,
     _preprocess_web_clip,
+    collect_ingest_paths,
+    convert_pdf_to_markdown,
     ingest_note,
 )
 from obsidian_llm_wiki.state import StateDB
@@ -188,6 +193,26 @@ def test_normalize_strips_empty(vault, config, db):
     assert "Neural Networks" in names
 
 
+def test_normalize_merges_plural_variants(vault, config, db):
+    result = _normalize_concepts(_make_concepts(["Action Flow", "Action Flows"]), db)
+    assert len(result) == 1
+    assert result[0][0] == "Action Flow"
+
+
+def test_normalize_reuses_existing_singular_canonical(vault, config, db):
+    db.upsert_concepts("raw/a.md", ["Action Flow"])
+    result = _normalize_concepts(_make_concepts(["Action Flows"]), db)
+    assert [name for name, _ in result] == ["Action Flow"]
+
+
+def test_normalize_filters_obvious_page_labels(vault, config, db):
+    result = _normalize_concepts(_make_concepts(["page 35", "Figure 2", "Process Mining"]), db)
+    names = [name for name, _ in result]
+    assert "page 35" not in [n.lower() for n in names]
+    assert "Figure 2" not in names
+    assert "Process Mining" in names
+
+
 # ── ingest_note ───────────────────────────────────────────────────────────────
 
 
@@ -253,7 +278,43 @@ def test_ingest_note_dedup_by_hash(vault, config, db):
     assert client.generate.call_count == 1
 
 
-def test_ingest_note_stores_concepts(vault, config, db):
+def test_ingest_note_pdf_pages_with_same_body_different_source_not_deduplicated(vault, config, db):
+    """PDF pages from different source PDFs must not be treated as duplicates
+    even if their extracted text is identical (e.g. blank pages, boilerplate)."""
+    body = "# Page 1\n\nBoilerplate disclaimer text identical across documents."
+    fm1 = "---\nsource_pdf: raw/FolderA/doc.pdf\n---\n"
+    fm2 = "---\nsource_pdf: raw/FolderB/doc.pdf\n---\n"
+    (vault / "raw" / "subA").mkdir()
+    (vault / "raw" / "subB").mkdir()
+    p1 = vault / "raw" / "subA" / "page-001.md"
+    p2 = vault / "raw" / "subB" / "page-001.md"
+    p1.write_text(fm1 + body, encoding="utf-8")
+    p2.write_text(fm2 + body, encoding="utf-8")
+    client = _make_client(_analysis_json())
+    r1 = ingest_note(p1, config, client, db)
+    r2 = ingest_note(p2, config, client, db)
+    assert r1 is not None, "first PDF page should be ingested"
+    assert r2 is not None, "second PDF page from different source must NOT be skipped as duplicate"
+    assert client.generate.call_count == 2
+
+
+def test_ingest_note_pdf_pages_same_source_same_body_are_deduplicated(vault, config, db):
+    """PDF pages from the *same* source PDF with identical text remain deduplicated."""
+    body = "# Page 1\n\nBoilerplate disclaimer text identical across pages."
+    fm = "---\nsource_pdf: raw/FolderA/doc.pdf\n---\n"
+    (vault / "raw" / "subA").mkdir()
+    p1 = vault / "raw" / "subA" / "page-001.md"
+    p2 = vault / "raw" / "subA" / "page-002.md"
+    p1.write_text(fm + body, encoding="utf-8")
+    p2.write_text(fm + body, encoding="utf-8")
+    client = _make_client(_analysis_json())
+    ingest_note(p1, config, client, db)
+    result = ingest_note(p2, config, client, db)
+    assert result is None, "same body from same PDF should still be skipped as duplicate"
+    assert client.generate.call_count == 1
+
+
+
     path = _write_raw(vault, "ml.md", "# ML\n\nNeural networks and backprop.")
     client = _make_client(_analysis_json(concepts=["Neural Networks", "Backpropagation"]))
     ingest_note(path, config, client, db)
@@ -280,6 +341,18 @@ def test_ingest_note_creates_source_summary_page(vault, config, db):
     ingest_note(path, config, client, db)
     sources = list((vault / "wiki" / "sources").glob("*.md"))
     assert sources, "Source summary page should be created"
+
+
+def test_source_page_mirrors_raw_subfolder_structure(vault, config, db):
+    """Source page for raw/docs/subdir/page.md must land at wiki/sources/docs/subdir/page.md."""
+    subdir = vault / "raw" / "docs" / "subdir"
+    subdir.mkdir(parents=True, exist_ok=True)
+    path = subdir / "page.md"
+    path.write_text("# Page\n\nContent.", encoding="utf-8")
+    client = _make_client(_analysis_json(concepts=["Content"]))
+    ingest_note(path, config, client, db)
+    expected = vault / "wiki" / "sources" / "docs" / "subdir" / "page.md"
+    assert expected.exists(), f"Expected source summary at {expected}"
 
 
 def test_source_page_yaml_with_colon_title(vault, config, db):
@@ -325,6 +398,16 @@ def test_source_page_roundtrip(vault, config, db):
     assert isinstance(meta["aliases"], list)
     assert "## Summary" in body
     assert "## Concepts" in body
+
+
+def test_source_page_raw_file_is_clickable_wikilink(vault, config, db):
+    path = _write_raw(vault, "source-link.md", "# Link\n\nSource link test.")
+    client = _make_client(_analysis_json(concepts=["Linking"]))
+    ingest_note(path, config, client, db)
+    sources = list((vault / "wiki" / "sources").glob("*.md"))
+    assert sources
+    source_text = sources[0].read_text(encoding="utf-8")
+    assert "- **Raw file:** [[raw/source-link.md]]" in source_text
 
 
 def test_source_page_media_section(vault, config, db):
@@ -426,7 +509,7 @@ def test_merge_unions_topics():
 
 
 def test_analyze_body_single_call_for_short_note(vault, config, db):
-    """Body <= fast_ctx // 2 → exactly one generate call."""
+    """Body <= fast_ctx * ingest_chunk_ratio -> exactly one generate call."""
     client = _make_client(_analysis_json())
     body = "Short note content."
     _analyze_body(body, [], "test.md", client, config)
@@ -434,9 +517,9 @@ def test_analyze_body_single_call_for_short_note(vault, config, db):
 
 
 def test_analyze_body_multi_call_for_long_note(vault, config, db):
-    """Body > fast_ctx // 2 → one call per chunk."""
+    """Body > fast_ctx * ingest_chunk_ratio -> one call per chunk."""
     config2 = Config(vault=vault, ollama={"fast_ctx": 100})  # tiny ctx for test
-    chunk_size = 100 // 2  # = 50 chars per chunk
+    chunk_size = int(100 * config2.pipeline.ingest_chunk_ratio)
     body = "x" * 200  # 200 chars → 4 chunks
     client = _make_client(_analysis_json())
     result = _analyze_body(body, [], "long.md", client, config2)
@@ -466,7 +549,8 @@ def test_analyze_body_parallel_mode(vault):
     body = "x" * 200
     client = _make_client(_analysis_json(concepts=["A"]))
     result = _analyze_body(body, [], "long.md", client, config2)
-    assert client.generate.call_count == -(-200 // 50)  # same chunk count
+    chunk_size = int(100 * config2.pipeline.ingest_chunk_ratio)
+    assert client.generate.call_count == -(-200 // chunk_size)
     assert isinstance(result, AnalysisResult)
 
 
@@ -516,3 +600,81 @@ def test_merge_chunk_results_picks_first_detected_language():
     )
     merged = _merge_chunk_results([make(None), make("de"), make("fr")])
     assert merged.language == "de"
+
+
+def test_convert_pdf_to_markdown_creates_one_file_per_page(vault, monkeypatch):
+    pdf_path = vault / "raw" / "OneNote" / "Team Notes.pdf"
+    pdf_path.parent.mkdir(parents=True)
+    pdf_path.write_bytes(b"%PDF-1.4")
+
+    class _FakePage:
+        def __init__(self, text):
+            self._text = text
+
+        def extract_text(self):
+            return self._text
+
+    class _FakeReader:
+        def __init__(self, _path):
+            self.pages = [_FakePage("Alpha"), _FakePage("Beta")]
+
+    monkeypatch.setitem(sys.modules, "pypdf", types.SimpleNamespace(PdfReader=_FakeReader))
+
+    written = convert_pdf_to_markdown(pdf_path)
+
+    assert [p.name for p in written] == ["page-001.md", "page-002.md"]
+    assert all(p.parent == _page_output_dir(pdf_path) for p in written)
+    assert "## Page 1" in written[0].read_text(encoding="utf-8")
+    assert "Alpha" in written[0].read_text(encoding="utf-8")
+    assert "## Page 2" in written[1].read_text(encoding="utf-8")
+    assert "Beta" in written[1].read_text(encoding="utf-8")
+
+
+def test_collect_ingest_paths_includes_existing_md_and_converted_pdf_pages(vault, config, monkeypatch):
+    md_path = _write_raw(vault, "note.md", "# Existing\n\nContent")
+    pdf_path = vault / "raw" / "Docs" / "Deck.pdf"
+    pdf_path.parent.mkdir(parents=True)
+    pdf_path.write_bytes(b"%PDF-1.4")
+
+    class _FakePage:
+        def __init__(self, text):
+            self._text = text
+
+        def extract_text(self):
+            return self._text
+
+    class _FakeReader:
+        def __init__(self, _path):
+            self.pages = [_FakePage("One"), _FakePage("Two")]
+
+    monkeypatch.setitem(sys.modules, "pypdf", types.SimpleNamespace(PdfReader=_FakeReader))
+
+    collected = collect_ingest_paths(config)
+
+    names = {p.name for p in collected}
+    assert md_path.name in names
+    assert "page-001.md" in names
+    assert "page-002.md" in names
+
+
+def test_collect_ingest_paths_explicit_pdf_returns_page_files(vault, config, monkeypatch):
+    pdf_path = vault / "raw" / "Multi Page.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4")
+
+    class _FakePage:
+        def __init__(self, text):
+            self._text = text
+
+        def extract_text(self):
+            return self._text
+
+    class _FakeReader:
+        def __init__(self, _path):
+            self.pages = [_FakePage("One page")]
+
+    monkeypatch.setitem(sys.modules, "pypdf", types.SimpleNamespace(PdfReader=_FakeReader))
+
+    collected = collect_ingest_paths(config, [pdf_path])
+
+    assert len(collected) == 1
+    assert collected[0] == _page_output_dir(pdf_path) / "page-001.md"
