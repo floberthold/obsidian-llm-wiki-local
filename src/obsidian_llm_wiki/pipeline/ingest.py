@@ -69,6 +69,11 @@ def _build_analysis_prompt(
         f"For each concept, provide 3-5 short surface forms used in running text "
         f"(abbreviations, short names). Example: name='Program Counter (PC)', "
         f"aliases=['PC', 'program counter']. Use empty list if no natural aliases exist.\n\n"
+        f"DO NOT include the following as concepts — they are auto-generated context markers, not knowledge concepts:\n"
+        f"- Standalone page labels (already filtered elsewhere)\n"
+        f"- Bare dates, e.g. 'January 2024', '2024-03-15', '3/15/2024'\n"
+        f"- Meeting or transcript timestamps, e.g. '00:05:23', '10:30 AM'\n"
+        f"- Generic navigation entries such as 'index' or 'table of contents'\n\n"
         f"NOTE CONTENT:\n{body}"
     )
 
@@ -241,17 +246,47 @@ _CONCEPT_JUNK_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Bare dates: "2024-03-15", "3/15/2024", "15.03.2024", "January 2024", "Jan 2025"
+_MONTHS_INNER = (
+    r"january|february|march|april|may|june|july|august|september|october|november|december"
+    r"|jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec"
+)
+_CONCEPT_TEMPORAL_RE = re.compile(
+    r"^(?:"
+    r"\d{4}-\d{2}-\d{2}"  # ISO: 2024-03-15
+    r"|\d{1,2}/\d{1,2}/\d{2,4}"  # US: 3/15/2024
+    r"|\d{1,2}\.\d{2}\.\d{4}"  # EU: 15.03.2024
+    r"|(?:" + _MONTHS_INNER + r")\s+\d{4}"  # Named month: January 2024
+    r"|\d{4}\s+(?:" + _MONTHS_INNER + r")"  # Year-first: 2024 January
+    r")$",
+    re.IGNORECASE,
+)
+
+# Meeting/transcript timestamps: "00:05:23", "9:15", "10:30 AM", "9:15:00 PM"
+_CONCEPT_TIMESTAMP_RE = re.compile(
+    r"^\d{1,2}:\d{2}(?::\d{2})?(?:\s*[AP]M)?$",
+    re.IGNORECASE,
+)
+
 _SINGULAR_EXCEPTIONS = frozenset({"analysis", "news", "series", "species", "status"})
 
 
 def _is_valid_concept_name(name: str) -> bool:
-    """Drop obviously low-information concepts like page/figure labels."""
+    """Drop obviously low-information concepts like page/figure labels, bare dates, timestamps, and index entries."""
     stripped = name.strip()
     if not stripped:
         return False
     if _CONCEPT_JUNK_RE.match(stripped):
         return False
     if re.fullmatch(r"\d+(?:\.\d+)*", stripped):
+        return False
+    # Reject bare dates and timestamps — auto-generated context markers from transcripts/PDFs
+    if _CONCEPT_TEMPORAL_RE.fullmatch(stripped):
+        return False
+    if _CONCEPT_TIMESTAMP_RE.fullmatch(stripped):
+        return False
+    # Reject standalone "index" — navigation artifact, not a knowledge concept
+    if stripped.lower() == "index":
         return False
     return True
 
@@ -368,6 +403,75 @@ def _page_output_dir(pdf_path: Path) -> Path:
     return pdf_path.parent / sanitize_filename(pdf_path.stem)
 
 
+def _cleanup_source_summary_mirror(
+    output_dir: Path,
+    config: Config,
+) -> None:
+    """Remove stale mirrored source summaries for a reconverted PDF folder."""
+    try:
+        rel_output = output_dir.relative_to(config.raw_dir)
+    except ValueError:
+        return
+
+    source_dir = config.sources_dir / rel_output
+    if not source_dir.exists():
+        return
+
+    for pattern in ("page-*.md", "group-*.md"):
+        for existing in source_dir.glob(pattern):
+            existing.unlink(missing_ok=True)
+
+
+def _write_pdf_group_source_mirror(group_path: Path, config: Config) -> None:
+    """Write a deterministic source mirror for grouped PDF markdown.
+
+    This keeps wiki/sources aligned with grouped raw outputs immediately after
+    conversion, even before a full LLM ingest refresh runs.
+    """
+    try:
+        src_meta, body = parse_note(group_path)
+    except Exception:
+        src_meta, body = {}, _read_text_with_fallback(group_path)
+
+    rel_raw = group_path.relative_to(config.vault).as_posix()
+    out_path = config.sources_dir / group_path.relative_to(config.raw_dir)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    title = src_meta.get("title") or group_path.stem.replace("-", " ").title()
+    first_para = next((line.strip() for line in body.splitlines() if line.strip()), "")
+    summary = first_para[:400] if first_para else "Grouped PDF extract."
+    source_url = src_meta.get("source") or src_meta.get("url") or ""
+    now = datetime.now().strftime("%Y-%m-%d")
+
+    out_meta: dict = {
+        "title": title,
+        "aliases": generate_aliases(title, ""),
+        "tags": ["source", "pdf-group"],
+        "status": "published",
+        "source_file": rel_raw,
+        "quality": "medium",
+        "created": now,
+    }
+    if source_url:
+        out_meta["source_url"] = source_url
+
+    body_parts = [
+        f"# {title}",
+        "",
+        "## Summary",
+        summary,
+        "",
+        "## Source Info",
+        "- **Quality:** medium",
+        f"- **Raw file:** [[{rel_raw}]]",
+        f"- **Ingested:** {now}",
+    ]
+    if source_url:
+        body_parts.append(f"- **URL:** {source_url}")
+
+    write_note(out_path, out_meta, "\n".join(body_parts))
+
+
 def _is_section_boundary(text: str, patterns: list[str]) -> bool:
     first_non_empty = ""
     for line in text.splitlines():
@@ -448,6 +552,8 @@ def convert_pdf_to_markdown(
             existing.unlink(missing_ok=True)
         for existing in output_dir.glob("group-*.md"):
             existing.unlink(missing_ok=True)
+        if config is not None:
+            _cleanup_source_summary_mirror(output_dir, config)
 
     pipeline = config.pipeline if config else None
     strategy = pipeline.pdf_split_strategy if pipeline else "grouped"
@@ -506,6 +612,8 @@ def convert_pdf_to_markdown(
             },
             f"## Pages {start_page}-{end_page}\n\n{body}\n",
         )
+        if config is not None:
+            _write_pdf_group_source_mirror(out_path, config)
         written_paths.append(out_path)
 
     log.info(
@@ -629,6 +737,35 @@ def _create_source_summary_page(
     return out_path
 
 
+def _ensure_source_summary_for_existing_ingest(
+    path: Path,
+    src_meta: dict,
+    body: str,
+    record: RawNoteRecord,
+    db: StateDB,
+    config: Config,
+) -> None:
+    """Backfill a missing source summary for already-ingested notes without re-analysis."""
+    out_path = config.sources_dir / path.relative_to(config.raw_dir)
+    if out_path.exists():
+        return
+
+    rel_path = path.relative_to(config.vault).as_posix()
+    concept_names = db.get_concepts_for_sources([rel_path])[:8]
+    concepts = [Concept(name=name, aliases=[]) for name in concept_names]
+    quality = record.quality if record.quality in {"low", "medium", "high"} else "medium"
+    summary = (record.summary or "").strip() or "No summary available."
+    result = AnalysisResult(
+        summary=summary,
+        concepts=concepts,
+        suggested_topics=[],
+        quality=quality,
+        language=record.language,
+    )
+    _create_source_summary_page(path, src_meta, result, config, body=body)
+    log.info("Rebuilt missing source summary for already-ingested note: %s", path.name)
+
+
 def ingest_note(
     path: Path,
     config: Config,
@@ -681,6 +818,10 @@ def ingest_note(
     record = db.get_raw(rel_path)
 
     if record and record.status == "ingested" and not force:
+        try:
+            _ensure_source_summary_for_existing_ingest(path, meta, body, record, db, config)
+        except Exception as e:
+            log.warning("Source summary backfill failed for %s: %s", path.name, e)
         log.info("Already ingested: %s", path.name)
         emit_event(
             config,

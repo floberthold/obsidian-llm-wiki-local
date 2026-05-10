@@ -213,6 +213,43 @@ def test_normalize_filters_obvious_page_labels(vault, config, db):
     assert "Process Mining" in names
 
 
+def test_normalize_filters_bare_dates(vault, config, db):
+    result = _normalize_concepts(
+        _make_concepts(["January 2024", "2024-03-15", "Jan 2025", "Process Mining"]), db
+    )
+    names = [name for name, _ in result]
+    assert "January 2024" not in names
+    assert "2024-03-15" not in names
+    assert "Jan 2025" not in names
+    assert "Process Mining" in names
+
+
+def test_normalize_filters_transcript_timestamps(vault, config, db):
+    result = _normalize_concepts(
+        _make_concepts(["00:05:23", "10:30 AM", "9:15:00 PM", "Process Mining"]), db
+    )
+    names = [name for name, _ in result]
+    assert "00:05:23" not in names
+    assert "10:30 AM" not in names
+    assert "9:15:00 PM" not in names
+    assert "Process Mining" in names
+
+
+def test_normalize_filters_standalone_index(vault, config, db):
+    result = _normalize_concepts(_make_concepts(["index", "Index", "Process Mining"]), db)
+    names = [name for name, _ in result]
+    assert not any(n.lower() == "index" for n in names)
+    assert "Process Mining" in names
+
+
+def test_normalize_keeps_compound_index_concepts(vault, config, db):
+    """'Index Fund' or 'Stock Market Index' are real concepts and must not be filtered."""
+    result = _normalize_concepts(_make_concepts(["Index Fund", "Stock Market Index"]), db)
+    names = [name for name, _ in result]
+    assert "Index Fund" in names
+    assert "Stock Market Index" in names
+
+
 # ── ingest_note ───────────────────────────────────────────────────────────────
 
 
@@ -254,6 +291,22 @@ def test_ingest_note_skip_already_ingested(vault, config, db):
     result = ingest_note(path, config, client, db)
     assert result is None
     # Client called only once (for first ingest)
+    assert client.generate.call_count == 1
+
+
+def test_ingest_note_skip_rebuilds_missing_source_summary(vault, config, db):
+    path = _write_raw(vault, "keep.md", "# Keep\n\nContent.")
+    client = _make_client(_analysis_json(concepts=["Inventory Management"]))
+
+    ingest_note(path, config, client, db)
+    source_path = vault / "wiki" / "sources" / "keep.md"
+    assert source_path.exists()
+    source_path.unlink()
+
+    result = ingest_note(path, config, client, db)
+
+    assert result is None
+    assert source_path.exists(), "Missing source summary should be rebuilt on skip"
     assert client.generate.call_count == 1
 
 
@@ -704,3 +757,35 @@ def test_convert_pdf_to_markdown_cleanup_removes_legacy_page_files(vault, config
 
     assert written[0].name == "group-001-001.md"
     assert not (out_dir / "page-001.md").exists()
+
+
+def test_convert_pdf_to_markdown_cleanup_removes_stale_source_summaries(vault, config, monkeypatch):
+    pdf_path = vault / "raw" / "Docs" / "Deck.pdf"
+    pdf_path.parent.mkdir(parents=True, exist_ok=True)
+    pdf_path.write_bytes(b"%PDF-1.4")
+
+    raw_out_dir = _page_output_dir(pdf_path)
+    raw_out_dir.mkdir(parents=True, exist_ok=True)
+    (raw_out_dir / "page-001.md").write_text("legacy raw", encoding="utf-8")
+
+    source_dir = config.sources_dir / "Docs" / "Deck"
+    source_dir.mkdir(parents=True, exist_ok=True)
+    (source_dir / "page-001.md").write_text("legacy source", encoding="utf-8")
+
+    class _FakePage:
+        def __init__(self, text):
+            self._text = text
+
+        def extract_text(self):
+            return self._text
+
+    class _FakeReader:
+        def __init__(self, _path):
+            self.pages = [_FakePage("Fresh content")]
+
+    monkeypatch.setitem(sys.modules, "pypdf", types.SimpleNamespace(PdfReader=_FakeReader))
+
+    written = convert_pdf_to_markdown(pdf_path, overwrite=True, config=config)
+
+    assert written[0].name == "group-001-001.md"
+    assert not (source_dir / "page-001.md").exists()
