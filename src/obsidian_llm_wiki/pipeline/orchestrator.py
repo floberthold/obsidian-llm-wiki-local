@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import os
 import logging
+import subprocess
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -48,6 +50,7 @@ class PipelineReport:
     compiled: int = 0
     failed: list[FailureRecord] = field(default_factory=list)
     published: int = 0
+    bundles_created: int = 0
     lint_issues: int = 0
     stubs_created: int = 0
     rounds: int = 0
@@ -74,16 +77,18 @@ class PipelineOrchestrator:
         self,
         paths: list[str] | None = None,
         auto_approve: bool = False,
+        build_bundles: bool = True,
         fix: bool = False,
         max_rounds: int = 2,
         dry_run: bool = False,
         on_progress: Callable[[str, int, int, float | None, str], None] | None = None,
     ) -> PipelineReport:
         """
-        Run full pipeline: ingest → compile → lint → [stubs] → [approve].
+        Run full pipeline: ingest → compile → lint → [stubs] → [approve] → [bundles].
 
         paths: specific raw note paths to ingest (None = ingest all changed notes)
         auto_approve: publish drafts immediately without manual review
+        build_bundles: generate project/client/app/idea bundle notes under wiki/projects/
         fix: create stubs for broken wikilinks after lint
         max_rounds: maximum compile rounds (round 2 retries transient failures only)
         dry_run: report what would happen; no LLM calls, no file writes
@@ -356,11 +361,22 @@ class PipelineOrchestrator:
             generate_index(config, db)
             append_log(config, f"run | {report.published} articles published")
 
+        # ── Bundles ────────────────────────────────────────────────────────────
+        if build_bundles and not dry_run:
+            report.bundles_created = _generate_bundles(config)
+            if report.bundles_created:
+                generate_index(config, db)
+                append_log(config, f"run | {report.bundles_created} bundle article(s) generated")
+
         # ── Commit ─────────────────────────────────────────────────────────────
-        if config.pipeline.auto_commit and not dry_run and (report.compiled or report.published):
+        if config.pipeline.auto_commit and not dry_run and (
+            report.compiled or report.published or report.bundles_created
+        ):
             msg = f"run: {report.compiled} compiled"
             if report.published:
                 msg += f", {report.published} published"
+            if report.bundles_created:
+                msg += f", {report.bundles_created} bundles"
             git_commit(config.vault, msg, paths=["wiki/", ".olw/"])
 
         return report
@@ -432,3 +448,41 @@ def _run_compile(
         FailureRecord(concept=name, reason=FailureReason.UNKNOWN) for name in failed_names
     ]
     return draft_paths, failure_records, concept_timings
+
+
+def _generate_bundles(config: Config) -> int:
+    """Run local bundle generation and return total generated bundle count."""
+    bundle_script = (
+        config.vault.parent / "local-llm-wiki-query" / "scripts" / "build_all_bundles.py"
+    )
+    if not bundle_script.exists():
+        log.warning("Bundle generation skipped; missing script: %s", bundle_script)
+        return 0
+
+    cmd = [sys.executable, str(bundle_script), "--vault", str(config.vault)]
+    proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+
+    stdout = (proc.stdout or "").strip()
+    stderr = (proc.stderr or "").strip()
+    if stdout:
+        for line in stdout.splitlines():
+            log.info("bundle: %s", line)
+    if stderr:
+        for line in stderr.splitlines():
+            log.warning("bundle: %s", line)
+
+    if proc.returncode != 0:
+        log.warning("Bundle generation failed with exit code %s", proc.returncode)
+        return 0
+
+    generated_clients = 0
+    for line in stdout.splitlines():
+        if line.startswith("Client bundles generated:"):
+            try:
+                generated_clients = int(line.split(":", 1)[1].strip())
+            except ValueError:
+                generated_clients = 0
+            break
+
+    # Aggregate bundles are always generated when the script succeeds.
+    return generated_clients + 4

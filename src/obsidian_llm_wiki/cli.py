@@ -1360,11 +1360,12 @@ def watch(vault_str, auto_approve):
 @cli.command()
 @click.option("--vault", "vault_str", envvar="OLW_VAULT", default=None)
 @click.option("--auto-approve", is_flag=True, help="Publish drafts immediately")
+@click.option("--skip-bundles", is_flag=True, help="Skip bundle generation stage")
 @click.option("--fix", is_flag=True, help="Create stubs for broken wikilinks")
 @click.option("--max-rounds", default=2, show_default=True, help="Max compile rounds")
 @click.option("--dry-run", is_flag=True, help="Report what would happen, make no changes")
-def run(vault_str, auto_approve, fix, max_rounds, dry_run):
-    """Run full pipeline: ingest → compile → lint → [approve]."""
+def run(vault_str, auto_approve, skip_bundles, fix, max_rounds, dry_run):
+    """Run full pipeline: ingest → compile → lint → [approve] → [bundles]."""
     from .pipeline.lock import pipeline_lock
     from .pipeline.orchestrator import PipelineOrchestrator
 
@@ -1414,6 +1415,7 @@ def run(vault_str, auto_approve, fix, max_rounds, dry_run):
 
                 report = orchestrator.run(
                     auto_approve=auto_approve,
+                    build_bundles=not skip_bundles,
                     fix=fix,
                     max_rounds=max_rounds,
                     dry_run=dry_run,
@@ -1441,6 +1443,7 @@ def run(vault_str, auto_approve, fix, max_rounds, dry_run):
         f"{report.timings.get('compile_r1', 0) + report.timings.get('compile_r2', 0):.1f}s",
     )
     table.add_row("Published", str(report.published), "")
+    table.add_row("Bundles", str(report.bundles_created), "")
     table.add_row("Lint issues", str(report.lint_issues), "")
     table.add_row("Stubs created", str(report.stubs_created), "")
     if report.rounds > 1:

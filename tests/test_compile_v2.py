@@ -345,6 +345,23 @@ def test_gather_sources_combines_multiple(vault):
     assert len(resolved) == 2
 
 
+def test_gather_sources_groups_page_family(vault):
+    page_dir = vault / "raw" / "OneNote" / "Fuchs Projects"
+    page_dir.mkdir(parents=True)
+    (page_dir / "page-001.md").write_text("---\ntitle: Page 1\n---\nAlpha.")
+    (page_dir / "page-002.md").write_text("---\ntitle: Page 2\n---\nBeta.")
+
+    text, resolved = _gather_sources(
+        ["raw/OneNote/Fuchs Projects/page-001.md", "raw/OneNote/Fuchs Projects/page-002.md"],
+        vault,
+    )
+
+    assert "Source cluster:" in text
+    assert "Alpha." in text
+    assert "Beta." in text
+    assert len(resolved) == 2
+
+
 def test_gather_sources_bare_filename_resolved(vault):
     """Model sometimes returns bare filename without raw/ prefix."""
     (vault / "raw" / "note.md").write_text("---\ntitle: Note\n---\nBody.")

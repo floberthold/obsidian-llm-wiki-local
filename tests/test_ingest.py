@@ -602,7 +602,7 @@ def test_merge_chunk_results_picks_first_detected_language():
     assert merged.language == "de"
 
 
-def test_convert_pdf_to_markdown_creates_one_file_per_page(vault, monkeypatch):
+def test_convert_pdf_to_markdown_creates_grouped_files(vault, config, monkeypatch):
     pdf_path = vault / "raw" / "OneNote" / "Team Notes.pdf"
     pdf_path.parent.mkdir(parents=True)
     pdf_path.write_bytes(b"%PDF-1.4")
@@ -620,14 +620,15 @@ def test_convert_pdf_to_markdown_creates_one_file_per_page(vault, monkeypatch):
 
     monkeypatch.setitem(sys.modules, "pypdf", types.SimpleNamespace(PdfReader=_FakeReader))
 
-    written = convert_pdf_to_markdown(pdf_path)
+    written = convert_pdf_to_markdown(pdf_path, overwrite=True, config=config)
 
-    assert [p.name for p in written] == ["page-001.md", "page-002.md"]
+    assert [p.name for p in written] == ["group-001-002.md"]
     assert all(p.parent == _page_output_dir(pdf_path) for p in written)
-    assert "## Page 1" in written[0].read_text(encoding="utf-8")
+    assert "## Pages 1-2" in written[0].read_text(encoding="utf-8")
+    assert "[Page 1]" in written[0].read_text(encoding="utf-8")
+    assert "[Page 2]" in written[0].read_text(encoding="utf-8")
     assert "Alpha" in written[0].read_text(encoding="utf-8")
-    assert "## Page 2" in written[1].read_text(encoding="utf-8")
-    assert "Beta" in written[1].read_text(encoding="utf-8")
+    assert "Beta" in written[0].read_text(encoding="utf-8")
 
 
 def test_collect_ingest_paths_includes_existing_md_and_converted_pdf_pages(vault, config, monkeypatch):
@@ -653,11 +654,10 @@ def test_collect_ingest_paths_includes_existing_md_and_converted_pdf_pages(vault
 
     names = {p.name for p in collected}
     assert md_path.name in names
-    assert "page-001.md" in names
-    assert "page-002.md" in names
+    assert "group-001-002.md" in names
 
 
-def test_collect_ingest_paths_explicit_pdf_returns_page_files(vault, config, monkeypatch):
+def test_collect_ingest_paths_explicit_pdf_returns_group_files(vault, config, monkeypatch):
     pdf_path = vault / "raw" / "Multi Page.pdf"
     pdf_path.write_bytes(b"%PDF-1.4")
 
@@ -677,4 +677,30 @@ def test_collect_ingest_paths_explicit_pdf_returns_page_files(vault, config, mon
     collected = collect_ingest_paths(config, [pdf_path])
 
     assert len(collected) == 1
-    assert collected[0] == _page_output_dir(pdf_path) / "page-001.md"
+    assert collected[0] == _page_output_dir(pdf_path) / "group-001-001.md"
+
+
+def test_convert_pdf_to_markdown_cleanup_removes_legacy_page_files(vault, config, monkeypatch):
+    pdf_path = vault / "raw" / "Deck.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4")
+    out_dir = _page_output_dir(pdf_path)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "page-001.md").write_text("legacy", encoding="utf-8")
+
+    class _FakePage:
+        def __init__(self, text):
+            self._text = text
+
+        def extract_text(self):
+            return self._text
+
+    class _FakeReader:
+        def __init__(self, _path):
+            self.pages = [_FakePage("Modern")]
+
+    monkeypatch.setitem(sys.modules, "pypdf", types.SimpleNamespace(PdfReader=_FakeReader))
+
+    written = convert_pdf_to_markdown(pdf_path, overwrite=True, config=config)
+
+    assert written[0].name == "group-001-001.md"
+    assert not (out_dir / "page-001.md").exists()

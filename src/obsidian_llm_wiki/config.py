@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tomllib
 from pathlib import Path
+from typing import Literal
 
 from pydantic import BaseModel, field_validator
 
@@ -73,6 +74,12 @@ def default_wiki_toml(
         f'# language = "en"  # ISO 639-1 output language; autodetects from notes if unset\n'
         f"telemetry_enabled = true\n"
         f'telemetry_jsonl_path = ".olw/metrics.jsonl"\n'
+        f'pdf_split_strategy = "grouped"\n'
+        f"pdf_max_chunk_pages = 4\n"
+        f"pdf_min_chunk_chars = 800\n"
+        f"pdf_max_chunk_chars = 14000\n"
+        f"pdf_preserve_page_markers = true\n"
+        f"pdf_section_patterns = [\"^#\", \"^chapter\\\\b\", \"^section\\\\b\", \"^part\\\\b\"]\n"
     )
 
 
@@ -112,6 +119,17 @@ class PipelineConfig(BaseModel):
     language: str | None = None  # ISO 639-1 output language; autodetects from notes if unset
     telemetry_enabled: bool = True
     telemetry_jsonl_path: str = ".olw/metrics.jsonl"
+    pdf_split_strategy: Literal["grouped", "per-page"] = "grouped"
+    pdf_max_chunk_pages: int = 4
+    pdf_min_chunk_chars: int = 800
+    pdf_max_chunk_chars: int = 14000
+    pdf_preserve_page_markers: bool = True
+    pdf_section_patterns: list[str] = [
+        r"^#",
+        r"^chapter\b",
+        r"^section\b",
+        r"^part\b",
+    ]
 
 
 class RagConfig(BaseModel):

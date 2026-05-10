@@ -140,6 +140,14 @@ def _truncate_to_budget(text: str, max_chars: int) -> str:
     return text
 
 
+def _source_group_key(path: Path) -> str:
+    """Group page-level sources by their parent folder while leaving standalone files alone."""
+    stem = path.stem.lower()
+    if stem.startswith("page-") and path.parent != path:
+        return path.parent.as_posix()
+    return path.as_posix()
+
+
 def _gather_sources(
     source_paths: list[str],
     vault: Path,
@@ -149,7 +157,8 @@ def _gather_sources(
     Read source files, return (combined_text, resolved_paths).
     Truncates if combined content exceeds max_chars.
     """
-    parts = []
+    grouped_parts: dict[str, list[str]] = {}
+    group_titles: dict[str, str] = {}
     resolved = []
     for sp in source_paths:
         # Try path as-is, then prepend raw/ (model often returns bare filenames)
@@ -160,10 +169,19 @@ def _gather_sources(
             continue
         try:
             meta, body = parse_note(p)
-            parts.append(f"## Source: {p.name}\n{body}")
+            group_key = _source_group_key(p)
+            group_titles.setdefault(group_key, p.parent.as_posix() if group_key != p.as_posix() else p.name)
+            grouped_parts.setdefault(group_key, []).append(f"### Source: {p.name}\n{body}")
             resolved.append(sp)
         except Exception as e:
             log.warning("Could not read %s: %s", sp, e)
+
+    parts = []
+    for group_key, items in grouped_parts.items():
+        if len(items) > 1:
+            parts.append(f"## Source cluster: {group_titles.get(group_key, group_key)}\n\n" + "\n\n---\n\n".join(items))
+        else:
+            parts.append(items[0].replace("### Source:", "## Source:", 1))
 
     combined = "\n\n---\n\n".join(parts)
     return _truncate_to_budget(combined, max_chars), resolved

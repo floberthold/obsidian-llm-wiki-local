@@ -463,9 +463,30 @@ def test_orchestrator_dry_run_converts_pdf_into_page_markdown(config, db, monkey
     orch = PipelineOrchestrator(config, make_mock_client(), db)
     report = orch.run(paths=[str(pdf_path)], dry_run=True)
 
-    assert report.ingested == 2
-    assert (config.vault / "raw" / "Slides" / "page-001.md").exists()
-    assert (config.vault / "raw" / "Slides" / "page-002.md").exists()
+    assert report.ingested == 1
+    assert (config.vault / "raw" / "Slides" / "group-001-002.md").exists()
+
+
+def test_orchestrator_generates_bundles_by_default(config, db):
+    with patch("obsidian_llm_wiki.pipeline.orchestrator._generate_bundles", return_value=3) as mock_bundles:
+        with patch("obsidian_llm_wiki.pipeline.orchestrator._run_compile") as mock_compile:
+            mock_compile.return_value = ([], [], {})
+            orch = PipelineOrchestrator(config, make_mock_client(), db)
+            report = orch.run(paths=[])
+
+    mock_bundles.assert_called_once_with(config)
+    assert report.bundles_created == 3
+
+
+def test_orchestrator_can_skip_bundle_generation(config, db):
+    with patch("obsidian_llm_wiki.pipeline.orchestrator._generate_bundles", return_value=3) as mock_bundles:
+        with patch("obsidian_llm_wiki.pipeline.orchestrator._run_compile") as mock_compile:
+            mock_compile.return_value = ([], [], {})
+            orch = PipelineOrchestrator(config, make_mock_client(), db)
+            report = orch.run(paths=[], build_bundles=False)
+
+    mock_bundles.assert_not_called()
+    assert report.bundles_created == 0
 
 
 def test_orchestrator_ingest_exception_logged_not_raised(config, db):

@@ -368,8 +368,63 @@ def _page_output_dir(pdf_path: Path) -> Path:
     return pdf_path.parent / sanitize_filename(pdf_path.stem)
 
 
-def convert_pdf_to_markdown(pdf_path: Path, overwrite: bool = False) -> list[Path]:
-    """Convert a PDF into one markdown file per page inside a sibling folder."""
+def _is_section_boundary(text: str, patterns: list[str]) -> bool:
+    first_non_empty = ""
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped:
+            first_non_empty = stripped
+            break
+    if not first_non_empty:
+        return False
+    lowered = first_non_empty.lower()
+    for pattern in patterns:
+        if re.match(pattern, lowered, flags=re.IGNORECASE):
+            return True
+    return False
+
+
+def _group_pdf_pages(
+    pages: list[tuple[int, str]],
+    max_pages: int,
+    min_chars: int,
+    max_chars: int,
+    section_patterns: list[str],
+) -> list[list[tuple[int, str]]]:
+    groups: list[list[tuple[int, str]]] = []
+    current_group: list[tuple[int, str]] = []
+    current_chars = 0
+
+    for page_number, text in pages:
+        page_chars = len(text)
+        starts_new_section = _is_section_boundary(text, section_patterns)
+
+        should_flush = bool(current_group) and (
+            len(current_group) >= max_pages
+            or current_chars + page_chars > max_chars
+            or (starts_new_section and current_chars >= min_chars)
+        )
+
+        if should_flush:
+            groups.append(current_group)
+            current_group = []
+            current_chars = 0
+
+        current_group.append((page_number, text))
+        current_chars += page_chars
+
+    if current_group:
+        groups.append(current_group)
+
+    return groups
+
+
+def convert_pdf_to_markdown(
+    pdf_path: Path,
+    overwrite: bool = False,
+    config: Config | None = None,
+) -> list[Path]:
+    """Convert a PDF into deterministic grouped markdown files inside a sibling folder."""
     try:
         from pypdf import PdfReader
     except Exception as e:
@@ -377,9 +432,9 @@ def convert_pdf_to_markdown(pdf_path: Path, overwrite: bool = False) -> list[Pat
         return []
 
     output_dir = _page_output_dir(pdf_path)
-    existing_pages = sorted(output_dir.glob("page-*.md")) if output_dir.exists() else []
-    if existing_pages and not overwrite:
-        return existing_pages
+    existing_groups = sorted(output_dir.glob("group-*.md")) if output_dir.exists() else []
+    if existing_groups and not overwrite:
+        return existing_groups
 
     try:
         reader = PdfReader(str(pdf_path))
@@ -391,30 +446,70 @@ def convert_pdf_to_markdown(pdf_path: Path, overwrite: bool = False) -> list[Pat
     if overwrite:
         for existing in output_dir.glob("page-*.md"):
             existing.unlink(missing_ok=True)
+        for existing in output_dir.glob("group-*.md"):
+            existing.unlink(missing_ok=True)
+
+    pipeline = config.pipeline if config else None
+    strategy = pipeline.pdf_split_strategy if pipeline else "grouped"
+    max_pages = pipeline.pdf_max_chunk_pages if pipeline else 4
+    min_chars = pipeline.pdf_min_chunk_chars if pipeline else 800
+    max_chars = pipeline.pdf_max_chunk_chars if pipeline else 14000
+    section_patterns = pipeline.pdf_section_patterns if pipeline else [r"^#", r"^chapter\\b"]
+    preserve_markers = pipeline.pdf_preserve_page_markers if pipeline else True
 
     rel_pdf = pdf_path.as_posix()
-    written_paths: list[Path] = []
+    extracted_pages: list[tuple[int, str]] = []
     for page_number, page in enumerate(reader.pages, start=1):
         text = (page.extract_text() or "").strip()
         if not text:
             log.debug("Skipping image-only PDF page %d in %s", page_number, pdf_path.name)
             continue
 
-        out_path = output_dir / f"page-{page_number:03d}.md"
+        extracted_pages.append((page_number, text))
+
+    if not extracted_pages:
+        return []
+
+    groups: list[list[tuple[int, str]]]
+    if strategy == "per-page":
+        groups = [[item] for item in extracted_pages]
+    else:
+        groups = _group_pdf_pages(
+            extracted_pages,
+            max_pages=max_pages,
+            min_chars=min_chars,
+            max_chars=max_chars,
+            section_patterns=section_patterns,
+        )
+
+    written_paths: list[Path] = []
+    for group in groups:
+        start_page = group[0][0]
+        end_page = group[-1][0]
+        out_path = output_dir / f"group-{start_page:03d}-{end_page:03d}.md"
+
+        if preserve_markers:
+            content_blocks = [f"[Page {page}]\n\n{text}" for page, text in group]
+        else:
+            content_blocks = [text for _, text in group]
+        body = "\n\n---\n\n".join(content_blocks)
+
         write_note(
             out_path,
             {
-                "title": f"{pdf_path.stem} - Page {page_number}",
+                "title": f"{pdf_path.stem} - Pages {start_page}-{end_page}",
                 "source_pdf": rel_pdf,
-                "source_page": page_number,
-                "tags": ["pdf-page"],
+                "source_pages": [page for page, _ in group],
+                "source_page_start": start_page,
+                "source_page_end": end_page,
+                "tags": ["pdf-group"],
             },
-            f"## Page {page_number}\n\n{text}\n",
+            f"## Pages {start_page}-{end_page}\n\n{body}\n",
         )
         written_paths.append(out_path)
 
     log.info(
-        "Converted PDF %s into %d markdown page(s) under %s",
+        "Converted PDF %s into %d grouped markdown file(s) under %s",
         pdf_path.name,
         len(written_paths),
         output_dir.name,
@@ -429,7 +524,7 @@ def convert_pdf_to_markdown(pdf_path: Path, overwrite: bool = False) -> list[Pat
 
 
 def collect_ingest_paths(config: Config, paths: list[Path] | None = None) -> list[Path]:
-    """Collect markdown paths for ingest, auto-converting PDFs into per-page notes."""
+    """Collect markdown paths for ingest, auto-converting PDFs into grouped notes."""
     if paths is None:
         candidates = list(config.raw_dir.rglob("*")) if config.raw_dir.exists() else []
     else:
@@ -444,7 +539,7 @@ def collect_ingest_paths(config: Config, paths: list[Path] | None = None) -> lis
 
         suffix = path.suffix.lower()
         if suffix == ".pdf":
-            for page_path in convert_pdf_to_markdown(path):
+            for page_path in convert_pdf_to_markdown(path, overwrite=True, config=config):
                 key = page_path.resolve().as_posix()
                 if key not in seen:
                     seen.add(key)
@@ -728,7 +823,7 @@ def ingest_all(
     rag=None,
     force: bool = False,
 ) -> list[tuple[Path, AnalysisResult | None]]:
-    """Ingest all markdown files in raw/, including per-page PDF conversions."""
+    """Ingest all markdown files in raw/, including grouped PDF conversions."""
     raw_files = collect_ingest_paths(config)
     # Snapshot concept names once before loop (for consistent prompt context)
     existing_topics = db.list_all_concept_names()
