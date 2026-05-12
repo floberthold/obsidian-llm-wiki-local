@@ -368,6 +368,15 @@ class StateDB:
         ).fetchall()
         return [r[0] for r in rows]
 
+    def delete_concepts_for_source(self, source_path: str) -> None:
+        """Remove all concept links for a raw source path.
+
+        Used when a source note is re-ingested with changed content so stale
+        concept mappings do not persist.
+        """
+        with self._tx():
+            self._conn.execute("DELETE FROM concepts WHERE source_path = ?", (source_path,))
+
     def upsert_aliases(self, concept_name: str, aliases: list[str]) -> None:
         """Merge aliases for a concept. Skips self-matches (alias == canonical)."""
         canonical_lower = concept_name.lower()

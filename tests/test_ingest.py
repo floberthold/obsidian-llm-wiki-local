@@ -20,6 +20,7 @@ from obsidian_llm_wiki.pipeline.ingest import (
     _merge_chunk_results,
     _normalize_concepts,
     _preprocess_web_clip,
+    _source_summary_path,
     collect_ingest_paths,
     convert_pdf_to_markdown,
     ingest_note,
@@ -319,6 +320,32 @@ def test_ingest_note_force_reingest(vault, config, db):
     assert client.generate.call_count == 2
 
 
+def test_ingest_note_reingests_when_content_changes_without_force(vault, config, db):
+    path = _write_raw(vault, "changed.md", "# First\n\nInitial content.")
+    client = _make_client(_analysis_json(concepts=["Alpha"]))
+    ingest_note(path, config, client, db)
+
+    path.write_text("# First\n\nInitial content updated.", encoding="utf-8")
+    result = ingest_note(path, config, client, db, force=False)
+
+    assert result is not None
+    assert client.generate.call_count == 2
+
+
+def test_ingest_note_reingest_replaces_stale_concepts_for_source(vault, config, db):
+    path = _write_raw(vault, "stale.md", "# Topic\n\nOld concepts.")
+    client = _make_client(_analysis_json(concepts=["Alpha"]))
+    ingest_note(path, config, client, db)
+
+    path.write_text("# Topic\n\nNew concept set.", encoding="utf-8")
+    client.generate.return_value = _analysis_json(concepts=["Beta"])
+    ingest_note(path, config, client, db, force=False)
+
+    linked = db.get_concepts_for_sources(["raw/stale.md"])
+    assert "Beta" in linked
+    assert "Alpha" not in linked
+
+
 def test_ingest_note_dedup_by_hash(vault, config, db):
     """Same content in two files → second skipped as duplicate."""
     content = "# Same\n\nIdentical body content here."
@@ -422,6 +449,17 @@ def test_source_page_yaml_with_colon_title(vault, config, db):
     assert meta["title"] == "Python: A Guide"
 
 
+def test_source_summary_path_condenses_long_nested_paths(vault, config):
+    long_parent = "nested-folder-" + ("a" * 180)
+    path = config.raw_dir / long_parent / "page.md"
+
+    target = _source_summary_path(config, path)
+
+    assert len(str(target)) < len(str(config.sources_dir / path.relative_to(config.raw_dir)))
+    assert target.parent != config.sources_dir / long_parent
+    assert target.name == "page.md"
+
+
 def test_source_page_aliases_are_list(vault, config, db):
     """Aliases must be a proper YAML list, not Python repr string."""
     path = _write_raw(vault, "ml.md", "# ML\n\nMachine Learning (ML) basics.")
@@ -489,6 +527,39 @@ def test_source_page_no_media_section_when_none(vault, config, db):
     assert sources
     source_text = sources[0].read_text()
     assert "## Media" not in source_text
+
+
+def test_source_page_preserves_existing_concepts_on_reingest(vault, config, db):
+    path = _write_raw(vault, "preserve.md", "# Preserve\n\nBody.")
+    client = _make_client(_analysis_json(concepts=["Extract", "Load"]))
+    ingest_note(path, config, client, db)
+
+    source_path = vault / "wiki" / "sources" / "preserve.md"
+    original = source_path.read_text(encoding="utf-8")
+    source_path.write_text(
+        original.replace("## Source Info", "- [[Throughput Optimization]]\n\n## Source Info")
+    )
+
+    path.write_text("# Preserve\n\nBody changed.", encoding="utf-8")
+    client.generate.return_value = _analysis_json(concepts=["Extract", "Performance Baseline"])
+    ingest_note(path, config, client, db, force=False)
+
+    updated = source_path.read_text(encoding="utf-8")
+    assert "- [[Throughput Optimization]]" in updated
+    assert "- [[Performance Baseline]]" in updated
+
+
+def test_source_page_filters_page_label_concepts(vault, config, db):
+    path = _write_raw(vault, "labels.md", "# Labels\n\nBody.")
+    client = _make_client(_analysis_json(concepts=["Page 7", "Figure 2", "Real Concept"]))
+
+    ingest_note(path, config, client, db)
+
+    source_path = vault / "wiki" / "sources" / "labels.md"
+    source_text = source_path.read_text(encoding="utf-8")
+    assert "- [[Real Concept]]" in source_text
+    assert "- [[Page 7]]" not in source_text
+    assert "- [[Figure 2]]" not in source_text
 
 
 def test_ingest_note_respects_max_concepts_per_source(vault, config, db):
@@ -731,6 +802,44 @@ def test_collect_ingest_paths_explicit_pdf_returns_group_files(vault, config, mo
 
     assert len(collected) == 1
     assert collected[0] == _page_output_dir(pdf_path) / "group-001-001.md"
+
+
+def test_collect_ingest_paths_pdf_reuses_existing_groups_without_overwrite(vault, config, monkeypatch):
+    pdf_path = vault / "raw" / "Deck.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4")
+    out_dir = _page_output_dir(pdf_path)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    existing_group = out_dir / "group-001-001.md"
+    existing_group.write_text("---\ntitle: Existing\n---\n\ncontent", encoding="utf-8")
+
+    called = {"overwrite": None}
+
+    def _fake_convert(path, overwrite=False, config=None):
+        called["overwrite"] = overwrite
+        return [existing_group]
+
+    monkeypatch.setattr("obsidian_llm_wiki.pipeline.ingest.convert_pdf_to_markdown", _fake_convert)
+
+    collected = collect_ingest_paths(config, [pdf_path])
+
+    assert called["overwrite"] is False
+    assert collected == [existing_group]
+
+
+def test_collect_ingest_paths_migrates_pagewise_markdown_to_grouped(vault, config):
+    folder = vault / "raw" / "OneNote" / "Legacy"
+    folder.mkdir(parents=True, exist_ok=True)
+    p1 = folder / "page-001.md"
+    p2 = folder / "page-002.md"
+    p1.write_text("---\ntitle: Page 1\n---\n\nAlpha", encoding="utf-8")
+    p2.write_text("---\ntitle: Page 2\n---\n\nBeta", encoding="utf-8")
+
+    collected = collect_ingest_paths(config)
+    names = {p.name for p in collected}
+
+    assert "group-001-002.md" in names
+    assert not p1.exists()
+    assert not p2.exists()
 
 
 def test_convert_pdf_to_markdown_cleanup_removes_legacy_page_files(vault, config, monkeypatch):

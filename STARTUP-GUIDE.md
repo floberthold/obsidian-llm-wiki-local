@@ -34,11 +34,22 @@
 set OLLAMA_NUM_PARALLEL=8 && setx OLLAMA_NUM_THREADS 12 && ollama serve
 ```
 
-#### 2nd cmd window
-
-**Note:** Wait 10-15 seconds after starting Ollama before running this command:
+if it already runs do:
 
 ```cmd
+taskkill /IM "ollama app.exe" /F
+taskkill /IM ollama.exe /F
+set OLLAMA_NUM_PARALLEL=8 && setx OLLAMA_NUM_THREADS 12 && ollama serve
+```
+
+#### 2nd cmd window
+
+**Note:** Wait 10-15 seconds after starting Ollama before running this command
+
+- Run the command from the correct directory
+
+```cmd
+cd my-obsidian-wiki
 set OLLAMA_NUM_PARALLEL=8 && set OLLAMA_NUM_THREADS=12 && olw run
 ```
 

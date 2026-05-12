@@ -31,6 +31,8 @@ from ..vault import (
 
 log = logging.getLogger(__name__)
 
+_MAX_SOURCE_PATH_LEN = 220
+
 _SYSTEM = (
     "You are a knowledge analyst. Read the provided note and extract structured information. "
     "Be concise and accurate. Do not invent information not present in the note. "
@@ -41,6 +43,33 @@ _SYSTEM = (
 
 def _content_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _condensed_source_dir_name(relative_dir: Path) -> str:
+    label = sanitize_filename(relative_dir.name, max_len=40) or "source"
+    digest = hashlib.sha1(relative_dir.as_posix().encode("utf-8")).hexdigest()[:8]
+    return f"{label}-{digest}"
+
+
+def _source_summary_dir(config: Config, relative_dir: Path) -> Path:
+    exact_dir = config.sources_dir / relative_dir
+    if len(str(exact_dir)) <= _MAX_SOURCE_PATH_LEN:
+        return exact_dir
+    return config.sources_dir / _condensed_source_dir_name(relative_dir)
+
+
+def _source_summary_path(config: Config, path: Path) -> Path:
+    rel_path = path.relative_to(config.raw_dir)
+    exact_path = config.sources_dir / rel_path
+    if len(str(exact_path)) <= _MAX_SOURCE_PATH_LEN:
+        return exact_path
+
+    if rel_path.parent == Path("."):
+        stem = sanitize_filename(rel_path.stem, max_len=60)
+        digest = hashlib.sha1(rel_path.as_posix().encode("utf-8")).hexdigest()[:8]
+        return config.sources_dir / f"{stem}-{digest}{rel_path.suffix}"
+
+    return _source_summary_dir(config, rel_path.parent) / rel_path.name
 
 
 def _read_text_with_fallback(path: Path) -> str:
@@ -371,6 +400,7 @@ _OBSIDIAN_EMBED_RE = re.compile(
     re.IGNORECASE,
 )
 _MD_IMAGE_RE = re.compile(r"!\[([^\]]*)\]\(([^)]+)\)")
+_PAGE_FILE_RE = re.compile(r"^page-(\d+)\.md$", re.IGNORECASE)
 
 
 def _preprocess_web_clip(content: str) -> str:
@@ -395,6 +425,16 @@ def _preprocess_web_clip(content: str) -> str:
     return "\n".join(cleaned)
 
 
+def _extract_page_number(path: Path) -> int | None:
+    m = _PAGE_FILE_RE.match(path.name)
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except ValueError:
+        return None
+
+
 def _is_ingest_candidate(path: Path) -> bool:
     return path.is_file() and "processed" not in path.parts and not path.name.startswith(".")
 
@@ -413,13 +453,23 @@ def _cleanup_source_summary_mirror(
     except ValueError:
         return
 
-    source_dir = config.sources_dir / rel_output
+    source_dir = _source_summary_dir(config, rel_output)
     if not source_dir.exists():
         return
 
     for pattern in ("page-*.md", "group-*.md"):
         for existing in source_dir.glob(pattern):
             existing.unlink(missing_ok=True)
+
+
+def _cleanup_page_source_summaries(config: Config, page_paths: list[Path]) -> None:
+    """Remove stale wiki/sources mirrors for migrated legacy page-*.md files."""
+    for page_path in page_paths:
+        try:
+            source_path = _source_summary_path(config, page_path)
+        except Exception:
+            continue
+        source_path.unlink(missing_ok=True)
 
 
 def _write_pdf_group_source_mirror(group_path: Path, config: Config) -> None:
@@ -434,7 +484,7 @@ def _write_pdf_group_source_mirror(group_path: Path, config: Config) -> None:
         src_meta, body = {}, _read_text_with_fallback(group_path)
 
     rel_raw = group_path.relative_to(config.vault).as_posix()
-    out_path = config.sources_dir / group_path.relative_to(config.raw_dir)
+    out_path = _source_summary_path(config, group_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     title = src_meta.get("title") or group_path.stem.replace("-", " ").title()
@@ -472,6 +522,28 @@ def _write_pdf_group_source_mirror(group_path: Path, config: Config) -> None:
     write_note(out_path, out_meta, "\n".join(body_parts))
 
 
+def _should_rebuild_pdf_groups(pdf_path: Path, output_dir: Path) -> bool:
+    """Decide whether grouped markdown needs to be rebuilt for a PDF.
+
+    Rebuild when grouped outputs are missing, when legacy page files are present,
+    or when the source PDF is newer than current grouped outputs.
+    """
+    existing_groups = sorted(output_dir.glob("group-*.md")) if output_dir.exists() else []
+    if not existing_groups:
+        return True
+
+    if any(output_dir.glob("page-*.md")):
+        return True
+
+    try:
+        pdf_mtime = pdf_path.stat().st_mtime
+    except OSError:
+        return False
+
+    newest_group_mtime = max((p.stat().st_mtime for p in existing_groups), default=0.0)
+    return pdf_mtime > newest_group_mtime
+
+
 def _is_section_boundary(text: str, patterns: list[str]) -> bool:
     first_non_empty = ""
     for line in text.splitlines():
@@ -486,6 +558,91 @@ def _is_section_boundary(text: str, patterns: list[str]) -> bool:
         if re.match(pattern, lowered, flags=re.IGNORECASE):
             return True
     return False
+
+
+def _migrate_pagewise_markdown_dir(dir_path: Path, config: Config) -> list[Path]:
+    """Convert legacy page-*.md files in a folder into grouped markdown files.
+
+    Migration is idempotent: it rewrites grouped files from page files, then
+    removes legacy pages and their source-summary mirrors.
+    """
+    page_paths = [
+        p for p in sorted(dir_path.glob("page-*.md")) if p.is_file() and _extract_page_number(p) is not None
+    ]
+    if not page_paths:
+        return []
+
+    pipeline = config.pipeline
+    preserve_markers = pipeline.pdf_preserve_page_markers
+    strategy = pipeline.pdf_split_strategy
+    max_pages = pipeline.pdf_max_chunk_pages
+    min_chars = pipeline.pdf_min_chunk_chars
+    max_chars = pipeline.pdf_max_chunk_chars
+    section_patterns = pipeline.pdf_section_patterns
+
+    pages: list[tuple[int, str]] = []
+    for page_path in page_paths:
+        page_number = _extract_page_number(page_path)
+        if page_number is None:
+            continue
+        try:
+            _, page_body = parse_note(page_path)
+        except Exception:
+            page_body = _read_text_with_fallback(page_path)
+        pages.append((page_number, page_body.strip()))
+
+    if not pages:
+        return []
+
+    pages.sort(key=lambda item: item[0])
+    if strategy == "per-page":
+        groups = [[item] for item in pages]
+    else:
+        groups = _group_pdf_pages(
+            pages,
+            max_pages=max_pages,
+            min_chars=min_chars,
+            max_chars=max_chars,
+            section_patterns=section_patterns,
+        )
+
+    written_paths: list[Path] = []
+    source_label = dir_path.name.replace("_", " ").strip() or "Grouped Pages"
+
+    for group in groups:
+        start_page = group[0][0]
+        end_page = group[-1][0]
+        out_path = dir_path / f"group-{start_page:03d}-{end_page:03d}.md"
+
+        blocks: list[str] = []
+        for page_number, text in group:
+            if preserve_markers:
+                if re.match(r"^\[\s*page\s+\d+\s*\]", text.strip(), flags=re.IGNORECASE):
+                    blocks.append(text)
+                else:
+                    blocks.append(f"[Page {page_number}]\n\n{text}")
+            else:
+                blocks.append(text)
+
+        body = "\n\n---\n\n".join(blocks)
+        write_note(
+            out_path,
+            {
+                "title": f"{source_label} - Pages {start_page}-{end_page}",
+                "source_pages": [page for page, _ in group],
+                "source_page_start": start_page,
+                "source_page_end": end_page,
+                "tags": ["pdf-group"],
+            },
+            f"## Pages {start_page}-{end_page}\n\n{body}\n",
+        )
+        written_paths.append(out_path)
+
+    _cleanup_page_source_summaries(config, page_paths)
+    for page_path in page_paths:
+        page_path.unlink(missing_ok=True)
+
+    return sorted(written_paths)
 
 
 def _group_pdf_pages(
@@ -640,6 +797,7 @@ def collect_ingest_paths(config: Config, paths: list[Path] | None = None) -> lis
 
     md_paths: list[Path] = []
     seen: set[str] = set()
+    migrated_dirs: set[str] = set()
 
     for path in sorted(candidates):
         if not _is_ingest_candidate(path):
@@ -647,12 +805,26 @@ def collect_ingest_paths(config: Config, paths: list[Path] | None = None) -> lis
 
         suffix = path.suffix.lower()
         if suffix == ".pdf":
-            for page_path in convert_pdf_to_markdown(path, overwrite=True, config=config):
+            output_dir = _page_output_dir(path)
+            overwrite = _should_rebuild_pdf_groups(path, output_dir)
+            for page_path in convert_pdf_to_markdown(path, overwrite=overwrite, config=config):
                 key = page_path.resolve().as_posix()
                 if key not in seen:
                     seen.add(key)
                     md_paths.append(page_path)
         elif suffix == ".md":
+            page_number = _extract_page_number(path)
+            if page_number is not None:
+                dir_key = path.parent.resolve().as_posix()
+                if dir_key not in migrated_dirs:
+                    migrated_dirs.add(dir_key)
+                    migrated = _migrate_pagewise_markdown_dir(path.parent, config)
+                    for migrated_path in migrated:
+                        key = migrated_path.resolve().as_posix()
+                        if key not in seen:
+                            seen.add(key)
+                            md_paths.append(migrated_path)
+                continue
             key = path.resolve().as_posix()
             if key not in seen:
                 seen.add(key)
@@ -670,6 +842,38 @@ def _collect_media_refs(body: str) -> list[str]:
         alt, url = m.group(1), m.group(2)
         refs.append(f"- ![{alt}]({url})")
     return refs
+
+
+def _extract_existing_source_concepts(body: str) -> list[str]:
+    """Extract concept link targets from an existing source summary Concepts section."""
+    lines = body.splitlines()
+    in_concepts = False
+    collected: list[str] = []
+    seen: set[str] = set()
+
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("## "):
+            in_concepts = stripped.lower() == "## concepts"
+            continue
+        if not in_concepts or not stripped:
+            continue
+        if not stripped.startswith("-"):
+            continue
+
+        for match in re.finditer(r"\[\[([^\]|]+)(?:\|[^\]]+)?\]\]", stripped):
+            target = sanitize_wikilink_target(match.group(1).strip())
+            if not target:
+                continue
+            if not _is_valid_concept_name(target):
+                continue
+            key = target.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            collected.append(target)
+
+    return collected
 
 
 def _create_source_summary_page(
@@ -694,10 +898,35 @@ def _create_source_summary_page(
     source_url = src_meta.get("source") or src_meta.get("url") or ""
     aliases = generate_aliases(title, "")  # source pages rarely have abbreviations
 
-    # Build concept list as [[wikilinks]]
-    concept_lines = "\n".join(
-        f"- [[{sanitize_wikilink_target(c.name)}]]" for c in result.concepts[:8] if c.name.strip()
-    )
+    existing_concepts: list[str] = []
+    if out_path.exists():
+        try:
+            _, existing_body = parse_note(out_path)
+            existing_concepts = _extract_existing_source_concepts(existing_body)
+        except Exception:
+            existing_concepts = []
+
+    merged_concepts: list[str] = []
+    concept_seen: set[str] = set()
+    for concept in existing_concepts:
+        key = concept.lower()
+        if key in concept_seen:
+            continue
+        concept_seen.add(key)
+        merged_concepts.append(concept)
+    for concept in result.concepts[:8]:
+        if not _is_valid_concept_name(concept.name):
+            continue
+        target = sanitize_wikilink_target(concept.name)
+        if not target:
+            continue
+        key = target.lower()
+        if key in concept_seen:
+            continue
+        concept_seen.add(key)
+        merged_concepts.append(target)
+
+    concept_lines = "\n".join(f"- [[{target}]]" for target in merged_concepts)
 
     out_meta: dict = {
         "title": title,
@@ -746,7 +975,7 @@ def _ensure_source_summary_for_existing_ingest(
     config: Config,
 ) -> None:
     """Backfill a missing source summary for already-ingested notes without re-analysis."""
-    out_path = config.sources_dir / path.relative_to(config.raw_dir)
+    out_path = _source_summary_path(config, path)
     if out_path.exists():
         return
 
@@ -818,23 +1047,25 @@ def ingest_note(
     record = db.get_raw(rel_path)
 
     if record and record.status == "ingested" and not force:
-        try:
-            _ensure_source_summary_for_existing_ingest(path, meta, body, record, db, config)
-        except Exception as e:
-            log.warning("Source summary backfill failed for %s: %s", path.name, e)
-        log.info("Already ingested: %s", path.name)
-        emit_event(
-            config,
-            event_type="function_timing",
-            function_name="ingest_note",
-            stage="ingest",
-            model=config.models.fast,
-            success=True,
-            outcome="skipped_already_ingested",
-            duration_ms=round((time.monotonic() - fn_t0) * 1000.0, 2),
-            note=path.name,
-        )
-        return None
+        if record.content_hash == h:
+            try:
+                _ensure_source_summary_for_existing_ingest(path, meta, body, record, db, config)
+            except Exception as e:
+                log.warning("Source summary backfill failed for %s: %s", path.name, e)
+            log.info("Already ingested: %s", path.name)
+            emit_event(
+                config,
+                event_type="function_timing",
+                function_name="ingest_note",
+                stage="ingest",
+                model=config.models.fast,
+                success=True,
+                outcome="skipped_already_ingested",
+                duration_ms=round((time.monotonic() - fn_t0) * 1000.0, 2),
+                note=path.name,
+            )
+            return None
+        log.info("Detected content change, re-ingesting: %s", path.name)
 
     # Pre-process web clips
     if meta.get("source") or meta.get("url"):  # web clipper adds these
@@ -926,6 +1157,7 @@ def ingest_note(
     max_concepts = config.pipeline.max_concepts_per_source
     normalized = _normalize_concepts(result.concepts[:max_concepts], db)
     canonical_names = [name for name, _ in normalized]
+    db.delete_concepts_for_source(rel_path)
     db.upsert_concepts(rel_path, canonical_names)
     for canonical, aliases in normalized:
         if aliases:
