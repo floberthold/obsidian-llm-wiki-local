@@ -789,7 +789,10 @@ def convert_pdf_to_markdown(
 
 
 def collect_ingest_paths(config: Config, paths: list[Path] | None = None) -> list[Path]:
-    """Collect markdown paths for ingest, auto-converting PDFs into grouped notes."""
+    """Collect markdown paths for ingest, auto-converting PDFs into grouped notes, and allowing arbitrary .md files as first-class input.
+
+    All .md files (not just grouped PDF markdown) are included for chunking, analysis, and summary/concept extraction.
+    """
     if paths is None:
         candidates = list(config.raw_dir.rglob("*")) if config.raw_dir.exists() else []
     else:
@@ -825,6 +828,7 @@ def collect_ingest_paths(config: Config, paths: list[Path] | None = None) -> lis
                             seen.add(key)
                             md_paths.append(migrated_path)
                 continue
+            # Accept all other .md files (not just grouped PDF markdown)
             key = path.resolve().as_posix()
             if key not in seen:
                 seen.add(key)
@@ -1005,9 +1009,10 @@ def ingest_note(
     force: bool = False,
 ) -> AnalysisResult | None:
     """
-    Ingest a single raw note.
+    Ingest a single raw note (.md file or grouped PDF markdown).
 
     Returns AnalysisResult or None if skipped (duplicate / already ingested).
+    Handles arbitrary .md files as first-class input, chunking and analyzing them for summary and concepts extraction.
     """
     fn_t0 = time.monotonic()
     try:
