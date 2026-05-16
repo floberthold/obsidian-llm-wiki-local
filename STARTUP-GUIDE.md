@@ -31,15 +31,17 @@
 #### 1st cmd window
 
 ```cmd
-set OLLAMA_NUM_PARALLEL=8 && setx OLLAMA_NUM_THREADS 12 && ollama serve
+set OLLAMA_VULKAN=1 && set OLLAMA_NUM_PARALLEL=6 && setx OLLAMA_NUM_THREADS 6 && ollama serve
 ```
+
+- Using VULKAN used integrated grpahics no CPU, otherwise only CPU
 
 if it already runs do:
 
 ```cmd
 taskkill /IM "ollama app.exe" /F
 taskkill /IM ollama.exe /F
-set OLLAMA_NUM_PARALLEL=8 && setx OLLAMA_NUM_THREADS 12 && ollama serve
+set OLLAMA_NUM_PARALLEL=6 && setx OLLAMA_NUM_THREADS 6 && ollama serve
 ```
 
 #### 2nd cmd window
@@ -50,7 +52,7 @@ set OLLAMA_NUM_PARALLEL=8 && setx OLLAMA_NUM_THREADS 12 && ollama serve
 
 ```cmd
 cd my-obsidian-wiki
-set OLLAMA_NUM_PARALLEL=8 && set OLLAMA_NUM_THREADS=12 && olw run
+set OLLAMA_NUM_PARALLEL=6 && set OLLAMA_NUM_THREADS=6 && olw run
 ```
 
 
