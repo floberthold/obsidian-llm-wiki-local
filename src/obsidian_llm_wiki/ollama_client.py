@@ -19,8 +19,8 @@ _STARTUP_HINT = (
     "Ollama not running. Start it with:\n"
     "  ollama serve\n"
     "Then pull required models:\n"
-    "  ollama pull gemma4:e4b\n"
-    "  ollama pull qwen2.5:14b\n"
+    "  ollama pull qwen3:4b\n"
+    "  ollama pull qwen3.6:35b-a3b\n"
     "  ollama pull nomic-embed-text"
 )
 

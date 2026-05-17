@@ -1,7 +1,7 @@
 """
 Ingest pipeline: raw note → chunk → analyze → embed → update state.
 
-Uses fast model (gemma4:e4b) for analysis.
+Uses the configured fast model (default: qwen3:4b) for analysis.
 """
 
 from __future__ import annotations

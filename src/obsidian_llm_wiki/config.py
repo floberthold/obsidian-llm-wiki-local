@@ -20,8 +20,8 @@ def _toml_quote(value: str) -> str:
 
 
 def default_wiki_toml(
-    fast_model: str = "gemma4:e4b",
-    heavy_model: str = "qwen2.5:14b",
+    fast_model: str = "qwen3:4b",
+    heavy_model: str = "qwen3.6:35b-a3b",
     ollama_url: str = "http://localhost:11434",
     provider_name: str = "ollama",
     provider_url: str | None = None,
@@ -84,8 +84,8 @@ def default_wiki_toml(
 
 
 class ModelsConfig(BaseModel):
-    fast: str = "gemma4:e4b"
-    heavy: str = "qwen2.5:14b"
+    fast: str = "qwen3:4b"
+    heavy: str = "qwen3.6:35b-a3b"
     embed: str = "nomic-embed-text"  # used only when RAG optional dependency is installed
 
 

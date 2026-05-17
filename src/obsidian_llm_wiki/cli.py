@@ -139,8 +139,8 @@ def init(vault_path: str, existing: bool, non_interactive: bool):
     # Only fall back to Ollama-specific model names when using Ollama; cloud providers
     # must have been configured explicitly via `olw setup`.
     _ollama = provider_name == "ollama"
-    fast = gcfg.fast_model if gcfg and gcfg.fast_model else ("gemma4:e4b" if _ollama else "")
-    heavy = gcfg.heavy_model if gcfg and gcfg.heavy_model else ("qwen2.5:14b" if _ollama else "")
+    fast = gcfg.fast_model if gcfg and gcfg.fast_model else ("qwen3:4b" if _ollama else "")
+    heavy = gcfg.heavy_model if gcfg and gcfg.heavy_model else ("qwen3.6:35b-a3b" if _ollama else "")
     provider_url = gcfg.provider_url if gcfg and gcfg.provider_url else None
     ollama_url = gcfg.ollama_url if gcfg and gcfg.ollama_url else "http://localhost:11434"
     effective_url = provider_url or ollama_url
@@ -363,9 +363,9 @@ def _pick_model(
         if connected:
             console.print(
                 "    [yellow]No models found.[/yellow] "
-                "Pull one first: [bold]ollama pull gemma4:e4b[/bold]"
+                "Pull one first: [bold]ollama pull qwen3:4b[/bold]"
             )
-        console.print("    (e.g. gemma4:e4b, llama3.2:3b, qwen2.5:14b)")
+        console.print("    (e.g. qwen3:4b, gemma3:4b, qwen3.6:35b-a3b)")
         raw = Prompt.ask("    Model name", default=default_fallback, console=console).strip()
         return raw if raw else default_fallback
 
@@ -553,8 +553,8 @@ def setup(non_interactive: bool, reset: bool, provider_preset: str | None):
         # ── Default model names per provider ──────────────────────────────────
         # For non-Ollama providers, leave defaults empty — model names are
         # provider-specific and must be entered by the user.
-        default_fast = "gemma4:e4b" if chosen_name == "ollama" else ""
-        default_heavy = "qwen2.5:14b" if chosen_name == "ollama" else ""
+        default_fast = "qwen3:4b" if chosen_name == "ollama" else ""
+        default_heavy = "qwen3.6:35b-a3b" if chosen_name == "ollama" else ""
         if chosen_name != "ollama" and not connected:
             console.print(
                 "    [dim]Tip: enter the model name exactly as the provider lists it "

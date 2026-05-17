@@ -55,7 +55,7 @@ Three-stage local LLM pipeline turning Obsidian raw notes into a synthesized wik
 
 ## Conventions
 
-- **Two LLM tiers:** fast model (gemma4:e4b, 8K ctx) for analysis/routing, heavy model (qwen2.5:14b, 16K ctx) for writing. For manual/smoke testing, use gemma4:e4b for both fast and heavy
+- **Two LLM tiers:** fast model (qwen3:4b, 8K ctx) for analysis/routing, heavy model (qwen3.6:35b-a3b, 16K ctx) for writing. For manual/smoke testing, use qwen3:4b for both fast and heavy
 - **Pydantic models for LLM output:** Keep schemas small and flat (no nested lists of objects) for 4B model reliability. JSON schema is injected into system prompts
 - **Atomic writes:** `vault.atomic_write()` uses temp file + rename for crash safety
 - **Content hashing:** SHA256 on note body (excluding frontmatter) for dedup and manual-edit detection

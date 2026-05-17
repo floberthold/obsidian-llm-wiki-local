@@ -84,11 +84,11 @@ python install.py
 
 ```bash
 # Install Ollama: https://ollama.com/download
-ollama pull gemma4:e4b      # fast model — analysis and routing
-ollama pull qwen2.5:14b     # heavy model — article writing (optional, 7B+ recommended)
+ollama pull qwen3:4b            # fast model — analysis and routing
+ollama pull qwen3.6:35b-a3b     # heavy model — article writing (optional, needs substantial RAM/VRAM)
 ```
 
-> **Minimal setup:** pull only `gemma4:e4b` and set both `fast` and `heavy` to it in the wizard.
+> **Minimal setup:** pull only `qwen3:4b` and set both `fast` and `heavy` to it in the wizard.
 
 ### 2b. CMD parallel
 
@@ -187,8 +187,8 @@ An interactive wizard selects a provider, configures the URL and optional API ke
 
   Step 3  Fast model  (analysis & routing · 3–8B recommended)
     #  Model           Size
-    1  gemma4:e4b      9.6 GB
-    2  phi4-mini       2.5 GB
+    1  qwen3:4b        2.5 GB
+    2  qwen3.6:35b-a3b 23.0 GB
     Select (number or name) [1]: _
   ...
 ```
@@ -397,8 +397,8 @@ my-wiki/
 
 ```toml
 [models]
-fast = "gemma4:e4b"        # extraction, analysis, query routing
-heavy = "qwen2.5:14b"     # article generation, Q&A answers
+fast = "qwen3:4b"               # extraction, analysis, query routing
+heavy = "qwen3.6:35b-a3b"       # article generation, Q&A answers
 # Single-model: set heavy = fast
 
 # ── Local Ollama (default) ────────────────────────────────────────────────────
@@ -549,8 +549,8 @@ RAG (embeddings) requires a provider that supports `/v1/embeddings`. The default
 
 | Role | Ollama | Cloud |
 |------|--------|-------|
-| Fast (analysis + routing) | `gemma4:e4b`, `llama3.2:3b` | `llama-3.1-8b-instant` (Groq), `mistral-7b` |
-| Heavy (article writing) | `qwen2.5:14b`, `llama3.1:8b` | `llama-3.3-70b` (Groq), `mistral-large` |
+| Fast (analysis + routing) | `qwen3:4b`, `gemma3:4b` | `llama-3.1-8b-instant` (Groq), `mistral-7b` |
+| Heavy (article writing) | `qwen3.6:35b-a3b`, `qwen3:14b` | `llama-3.3-70b` (Groq), `mistral-large` |
 | Single model (everything) | `llama3.1:8b`, `mistral:7b` | any 7B+ |
 
 Any model with JSON format / `response_format: json_object` support works. The tool degrades gracefully with smaller models.

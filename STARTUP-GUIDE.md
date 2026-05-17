@@ -1,7 +1,7 @@
 # Quick Startup Guide
 
 ## Prerequisites
-- Ollama installed and models pulled: `ollama pull gemma4:e4b` (and optionally `ollama pull qwen2.5:14b`)
+- Ollama installed and models pulled: `ollama pull qwen3:4b` and `ollama pull qwen3.6:35b-a3b`
 - Python 3.10+ with the project installed
 
 ## First Time Setup (One-time)

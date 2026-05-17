@@ -89,7 +89,7 @@ def test_save_load_full_config(cfg_dir: Path):
 
 
 def test_save_creates_parent_dirs(cfg_dir: Path):
-    cfg = GlobalConfig(fast_model="gemma4:e4b")
+    cfg = GlobalConfig(fast_model="qwen3:4b")
     save_global_config(cfg)
     path = _global_config_path()
     assert path.exists()
@@ -99,21 +99,21 @@ def test_save_creates_parent_dirs(cfg_dir: Path):
 def test_saved_file_is_valid_toml(cfg_dir: Path):
     cfg = GlobalConfig(
         vault="/tmp/wiki",
-        fast_model="gemma4:e4b",
-        heavy_model="qwen2.5:14b",
+        fast_model="qwen3:4b",
+        heavy_model="qwen3.6:35b-a3b",
         ollama_url="http://localhost:11434",
     )
     save_global_config(cfg)
     path = _global_config_path()
     with open(path, "rb") as f:
         data = tomllib.load(f)
-    assert data["fast_model"] == "gemma4:e4b"
-    assert data["heavy_model"] == "qwen2.5:14b"
+    assert data["fast_model"] == "qwen3:4b"
+    assert data["heavy_model"] == "qwen3.6:35b-a3b"
 
 
 def test_partial_config_no_null_keys(cfg_dir: Path):
     """None fields must not appear in the written TOML file."""
-    cfg = GlobalConfig(fast_model="gemma4:e4b")
+    cfg = GlobalConfig(fast_model="qwen3:4b")
     save_global_config(cfg)
     path = _global_config_path()
     raw = path.read_text()
@@ -164,7 +164,7 @@ def test_load_config_uses_global_vault(
     vault = tmp_path / "wiki"
     vault.mkdir()
     (vault / "wiki.toml").write_text(
-        '[models]\nfast = "gemma4:e4b"\nheavy = "qwen2.5:14b"\n[ollama]\nurl = "http://localhost:11434"\n'
+        '[models]\nfast = "qwen3:4b"\nheavy = "qwen3.6:35b-a3b"\n[ollama]\nurl = "http://localhost:11434"\n'
     )
 
     save_global_config(GlobalConfig(vault=str(vault)))
@@ -194,7 +194,7 @@ def test_load_config_detects_vault_from_cwd(
     vault = tmp_path / "myvault"
     vault.mkdir()
     (vault / "wiki.toml").write_text(
-        '[models]\nfast = "gemma4:e4b"\nheavy = "gemma4:e4b"\n[ollama]\nurl = "http://localhost:11434"\n'
+        '[models]\nfast = "qwen3:4b"\nheavy = "qwen3:4b"\n[ollama]\nurl = "http://localhost:11434"\n'
     )
     monkeypatch.delenv("OLW_VAULT", raising=False)
     monkeypatch.chdir(vault)
@@ -213,7 +213,7 @@ def test_load_config_detects_vault_from_subdir(
     subdir = vault / "raw" / "notes"
     subdir.mkdir(parents=True)
     (vault / "wiki.toml").write_text(
-        '[models]\nfast = "gemma4:e4b"\nheavy = "gemma4:e4b"\n[ollama]\nurl = "http://localhost:11434"\n'
+        '[models]\nfast = "qwen3:4b"\nheavy = "qwen3:4b"\n[ollama]\nurl = "http://localhost:11434"\n'
     )
     monkeypatch.delenv("OLW_VAULT", raising=False)
     monkeypatch.chdir(subdir)
@@ -236,15 +236,15 @@ def test_setup_non_interactive_no_config(runner: CliRunner, cfg_dir: Path):
 def test_setup_non_interactive_with_config(runner: CliRunner, cfg_dir: Path):
     save_global_config(
         GlobalConfig(
-            fast_model="gemma4:e4b",
-            heavy_model="qwen2.5:14b",
+            fast_model="qwen3:4b",
+            heavy_model="qwen3.6:35b-a3b",
             ollama_url="http://192.168.1.10:11434",
         )
     )
     result = runner.invoke(cli, ["setup", "--non-interactive"])
     assert result.exit_code == 0
-    assert "gemma4:e4b" in result.output
-    assert "qwen2.5:14b" in result.output
+    assert "qwen3:4b" in result.output
+    assert "qwen3.6:35b-a3b" in result.output
     assert "192.168.1.10" in result.output
 
 
@@ -284,15 +284,15 @@ def test_setup_wizard_saves_config(runner: CliRunner, cfg_dir: Path):
             cli,
             ["setup"],
             # provider default, URL default, fast, heavy, no vault
-            input="\n\ngemma4:e4b\nqwen2.5:14b\n\n",
+            input="\n\nqwen3:4b\nqwen3.6:35b-a3b\n\n",
             catch_exceptions=False,
         )
 
     assert result.exit_code == 0
     cfg = load_global_config()
     assert cfg is not None
-    assert cfg.fast_model == "gemma4:e4b"
-    assert cfg.heavy_model == "qwen2.5:14b"
+    assert cfg.fast_model == "qwen3:4b"
+    assert cfg.heavy_model == "qwen3.6:35b-a3b"
 
 
 def test_setup_wizard_model_number_selection(runner: CliRunner, cfg_dir: Path):
@@ -301,8 +301,8 @@ def test_setup_wizard_model_number_selection(runner: CliRunner, cfg_dir: Path):
         instance = MagicMock()
         instance.healthcheck.return_value = True
         instance.list_models_detailed.return_value = [
-            {"name": "gemma4:e4b", "size_gb": "4.3 GB"},
-            {"name": "qwen2.5:14b", "size_gb": "8.7 GB"},
+            {"name": "qwen3:4b", "size_gb": "2.5 GB"},
+            {"name": "qwen3.6:35b-a3b", "size_gb": "23.0 GB"},
         ]
         MockClient.return_value = instance
 
@@ -317,8 +317,8 @@ def test_setup_wizard_model_number_selection(runner: CliRunner, cfg_dir: Path):
     assert result.exit_code == 0
     cfg = load_global_config()
     assert cfg is not None
-    assert cfg.fast_model == "gemma4:e4b"
-    assert cfg.heavy_model == "qwen2.5:14b"
+    assert cfg.fast_model == "qwen3:4b"
+    assert cfg.heavy_model == "qwen3.6:35b-a3b"
 
 
 def test_setup_wizard_whitespace_input_uses_default(runner: CliRunner, cfg_dir: Path):
@@ -400,8 +400,8 @@ def test_init_defaults_without_global_config(runner: CliRunner, cfg_dir: Path, t
     assert result.exit_code == 0
 
     content = (vault / "wiki.toml").read_text()
-    assert "gemma4:e4b" in content
-    assert "qwen2.5:14b" in content
+    assert "qwen3:4b" in content
+    assert "qwen3.6:35b-a3b" in content
 
 
 def test_init_syncs_models_into_existing_wiki_toml(
@@ -412,7 +412,7 @@ def test_init_syncs_models_into_existing_wiki_toml(
     vault.mkdir()
     # Simulate old wiki.toml with stale heavy model
     old_toml = (
-        '[models]\nfast = "gemma4:e4b"\nheavy = "qwen2.5:14b"\n\n'
+        '[models]\nfast = "qwen3:4b"\nheavy = "qwen3.6:35b-a3b"\n\n'
         '[ollama]\nurl = "http://localhost:11434"\ntimeout = 600\n\n'
         "[pipeline]\nauto_approve = false\nauto_commit = true\n"
     )
@@ -420,8 +420,8 @@ def test_init_syncs_models_into_existing_wiki_toml(
 
     save_global_config(
         GlobalConfig(
-            fast_model="gemma4:e4b",
-            heavy_model="gemma4:e4b",
+            fast_model="qwen3:4b",
+            heavy_model="qwen3:4b",
             ollama_url="http://localhost:11434",
         )
     )
@@ -429,8 +429,8 @@ def test_init_syncs_models_into_existing_wiki_toml(
     assert result.exit_code == 0
 
     content = (vault / "wiki.toml").read_text()
-    # heavy should now be gemma4:e4b (patched from global config)
-    assert 'heavy = "gemma4:e4b"' in content
+    # heavy should now be qwen3:4b (patched from global config)
+    assert 'heavy = "qwen3:4b"' in content
     # pipeline settings must be preserved
     assert "auto_approve = false" in content
 

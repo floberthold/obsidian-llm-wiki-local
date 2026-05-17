@@ -24,8 +24,8 @@ case "$PROVIDER" in
     ollama)
         # OLLAMA_URL kept for backward compatibility
         PROVIDER_URL="${PROVIDER_URL:-${OLLAMA_URL:-http://localhost:11434}}"
-        FAST_MODEL="${FAST_MODEL:-gemma4:e4b}"
-        HEAVY_MODEL="${HEAVY_MODEL:-gemma4:e4b}"
+        FAST_MODEL="${FAST_MODEL:-qwen3:4b}"
+        HEAVY_MODEL="${HEAVY_MODEL:-qwen3.6:35b-a3b}"
         FAST_CTX=8192
         HEAVY_CTX=16384
         ;;
