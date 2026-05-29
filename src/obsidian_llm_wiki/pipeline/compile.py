@@ -237,7 +237,26 @@ def _inject_body_sections(body: str, source_paths: list[str], config: Config) ->
 
     # ## See Also: wikilinks already in body (sorted, deduplicated)
     linked = sorted(set(extract_wikilinks(body)))
-    see_also_lines = [f"- [[{t}]]" for t in linked if t]
+    # Build a map of all possible note titles to their relative paths in the vault
+    title_to_path = {}
+    # Search both drafts and published wiki articles
+    for title, path in list_wiki_articles(config.wiki_dir):
+        title_to_path[title] = path.relative_to(config.vault).as_posix()
+    if hasattr(config, 'drafts_dir'):
+        from ..vault import list_draft_articles
+        for title, path, _ in list_draft_articles(config.drafts_dir):
+            title_to_path[title] = path.relative_to(config.vault).as_posix()
+
+    see_also_lines = []
+    for t in linked:
+        if not t:
+            continue
+        # If the link target matches a known file, use its relative path
+        rel_path = title_to_path.get(t)
+        if rel_path:
+            see_also_lines.append(f"- [[{rel_path}|{t}]]")
+        else:
+            see_also_lines.append(f"- [[{t}]]")
 
     sections = "\n\n## Sources\n" + "\n".join(source_lines) if source_lines else ""
     if see_also_lines:

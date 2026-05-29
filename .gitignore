@@ -16,3 +16,4 @@ build/
 .coverage
 htmlcov/
 .pytest_cache/
+.webui_secret_key
