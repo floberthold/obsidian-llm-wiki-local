@@ -126,6 +126,8 @@ class LintIssue(BaseModel):
     path: str
     issue_type: Literal[
         "orphan",
+        "orphan_cluster",
+        "weak_cluster",
         "broken_link",
         "missing_frontmatter",
         "stale",

@@ -3,6 +3,8 @@ Lint pipeline: all structural checks, no LLM required.
 
 Checks:
   orphan           — concept page with no inbound [[wikilinks]] from other pages
+  orphan_cluster   — orphan that also sits in a singleton Leiden cluster (stronger signal)
+  weak_cluster     — orphan whose Leiden cluster has ≤2 members
   broken_link      — [[Target]] in body that resolves to no file
   missing_frontmatter — required fields (title, status, tags) absent
   stale            — file hash on disk != DB content_hash (manually edited)
@@ -16,7 +18,9 @@ Fix mode (--fix):
 from __future__ import annotations
 
 import hashlib
+import json
 import re
+from collections import Counter
 from pathlib import Path
 
 from ..config import Config
@@ -150,6 +154,30 @@ def _build_inbound_index(config: Config) -> dict[str, set[str]]:
     return inbound
 
 
+def _load_community_map(config: Config) -> tuple[dict[str, int], dict[int, int]]:
+    """Load Leiden community memberships from graphify's clustered graph.json.
+
+    Returns (norm_label → community_id, community_id → size).
+    Returns empty dicts silently if the graph file doesn't exist yet.
+    """
+    graph_path = config.vault / ".graph" / "graphify-out" / "graph.json"
+    if not graph_path.exists():
+        return {}, {}
+    try:
+        data = json.loads(graph_path.read_text(encoding="utf-8"))
+        title_to_community: dict[str, int] = {}
+        for node in data.get("nodes", []):
+            community = node.get("community")
+            if community is None:
+                continue
+            norm = node.get("norm_label") or node.get("label", "").lower()
+            title_to_community[norm] = community
+        community_sizes = dict(Counter(title_to_community.values()))
+        return title_to_community, community_sizes
+    except Exception:
+        return {}, {}
+
+
 def _concept_pages(config: Config) -> list[Path]:
     """Root-level wiki pages that are concept articles (not system files)."""
     if not config.wiki_dir.exists():
@@ -184,6 +212,7 @@ def run_lint(config: Config, db: StateDB, fix: bool = False) -> LintResult:
 
     title_index = _build_title_index(config, db=db)
     inbound_index = _build_inbound_index(config)
+    community_map, community_sizes = _load_community_map(config)
 
     # DB records keyed by vault-relative path
     db_articles = {a.path: a for a in db.list_articles(drafts_only=False) if not a.is_draft}
@@ -319,15 +348,40 @@ def run_lint(config: Config, db: StateDB, fix: bool = False) -> LintResult:
         # Exclude self-links and the index page
         linked_by -= {page.stem, "index", "log"}
         if not linked_by:
-            issues.append(
-                LintIssue(
-                    path=rel_path,
-                    issue_type="orphan",
-                    description="No other wiki page links to this page.",
-                    suggestion="Reference this concept from related pages or run `olw compile`.",
-                    auto_fixable=False,
-                )
+            community_id = community_map.get(title.lower()) or community_map.get(
+                page.stem.lower()
             )
+            c_size = community_sizes.get(community_id, 0) if community_id is not None else 0
+            if community_id is not None and c_size <= 1:
+                issues.append(
+                    LintIssue(
+                        path=rel_path,
+                        issue_type="orphan_cluster",
+                        description="No inbound links and is a singleton Leiden cluster — strongly disconnected.",
+                        suggestion="Merge into a related article or add wikilinks from related concept pages.",
+                        auto_fixable=False,
+                    )
+                )
+            elif community_id is not None and c_size <= 2:
+                issues.append(
+                    LintIssue(
+                        path=rel_path,
+                        issue_type="weak_cluster",
+                        description=f"No inbound links; Leiden cluster has only {c_size} member(s).",
+                        suggestion="Reference this concept from related pages or run `olw compile`.",
+                        auto_fixable=False,
+                    )
+                )
+            else:
+                issues.append(
+                    LintIssue(
+                        path=rel_path,
+                        issue_type="orphan",
+                        description="No other wiki page links to this page.",
+                        suggestion="Reference this concept from related pages or run `olw compile`.",
+                        auto_fixable=False,
+                    )
+                )
 
     # ── Tag + frontmatter checks for sources/ and queries/ ────────────────────
     concept_page_paths = {p for p in pages}
