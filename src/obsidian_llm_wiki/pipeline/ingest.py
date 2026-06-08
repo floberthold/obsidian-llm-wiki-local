@@ -21,6 +21,7 @@ from ..models import AnalysisResult, Concept, RawNoteRecord
 from ..protocols import LLMClientProtocol
 from ..state import StateDB
 from ..structured_output import request_structured
+from ..analytics import end_doc, start_doc
 from ..telemetry import emit_event
 from ..vault import (
     chunk_text,
@@ -484,7 +485,8 @@ def _cleanup_page_source_summaries(config: Config, page_paths: list[Path]) -> No
     for page_path in page_paths:
         try:
             source_path = _source_summary_path(config, page_path)
-        except Exception:
+        except Exception as e:
+            log.debug("Could not resolve source summary path for '%s': %s", page_path.name, e)
             continue
         source_path.unlink(missing_ok=True)
 
@@ -1391,8 +1393,8 @@ def _write_document_aggregate(source_dir: Path, config: Config, db: StateDB) -> 
             if existing_meta.get("group_sig") == current_sig:
                 log.debug("Document aggregate up-to-date: %s", source_dir.name)
                 return None
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("Could not read existing aggregate for '%s': %s — will regenerate", source_dir.name, e)
 
     # Merge concepts across all groups (most cross-group concepts first, cap 30)
     concept_counts: dict[str, int] = {}
@@ -1607,6 +1609,7 @@ def ingest_note(
     # LLM analysis — use existing concept names so model can reuse canonical names
     if existing_topics is None:
         existing_topics = db.list_all_concept_names()
+    start_doc(rel_path, "ingest")
     try:
         result: AnalysisResult = _analyze_body(
             body=body,
@@ -1617,6 +1620,7 @@ def ingest_note(
         )
     except Exception as e:
         log.error("Analysis failed for %s: %s", path.name, e)
+        end_doc(status="failed", error=str(e))
         db.upsert_raw(
             RawNoteRecord(
                 path=rel_path,
@@ -1675,6 +1679,7 @@ def ingest_note(
         result.quality,
         [c.name for c in result.concepts[:3]],
     )
+    end_doc(status="ok")
     emit_event(
         config,
         event_type="function_timing",

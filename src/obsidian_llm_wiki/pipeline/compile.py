@@ -31,6 +31,7 @@ from ..protocols import LLMClientProtocol
 from ..sanitize import sanitize_tags
 from ..state import StateDB
 from ..structured_output import StructuredOutputError, request_structured
+from ..analytics import end_doc, start_doc
 from ..telemetry import emit_event
 from ..vault import (
     atomic_write,
@@ -73,8 +74,8 @@ def _load_vault_schema(config: Config) -> str:
     if config.schema_path.exists():
         try:
             return config.schema_path.read_text(encoding="utf-8")[:1500]
-        except Exception:
-            pass
+        except Exception as e:
+            log.warning("Could not read vault-schema.md: %s", e)
     return ""
 
 
@@ -451,11 +452,13 @@ def compile_concepts(
         if on_progress:
             on_progress(idx, total, name)
         _t_concept = time.monotonic()
+        start_doc(name, "compile")
 
         source_paths = db.get_sources_for_concept(name)
         is_stub = db.has_stub(name)
 
         if not source_paths and not is_stub:
+            end_doc(status="skipped")
             continue
 
         # Manual edit protection
@@ -470,9 +473,19 @@ def compile_concepts(
                     art_rec = db.get_article(str(wiki_path.relative_to(config.vault)))
                     if art_rec and art_rec.content_hash != _content_hash(existing_body):
                         log.info("Skipping '%s' — manually edited (use --force to override)", name)
+                        end_doc(status="skipped")
                         continue
-            except Exception:
-                pass
+            except Exception as e:
+                if not force:
+                    log.warning(
+                        "Cannot read existing article '%s' (%s) — skipping to avoid overwrite"
+                        " (use --force to override)",
+                        name,
+                        e,
+                    )
+                    end_doc(status="skipped")
+                    continue
+                log.warning("Cannot read existing article '%s' (%s) — overwriting due to --force", name, e)
 
         # For stubs: compile with empty sources using a lightweight stub prompt
         if is_stub and not source_paths:
@@ -495,6 +508,7 @@ def compile_concepts(
                 )
             except (StructuredOutputError, LLMBadRequestError) as e:
                 log.error("Failed to write stub '%s': %s", name, e)
+                end_doc(status="failed", error=str(e))
                 failed.append(name)
                 continue
             draft_path = _write_draft(
@@ -513,6 +527,7 @@ def compile_concepts(
             elapsed = time.monotonic() - _t_concept
             concept_timings[name] = elapsed
             log.info("Stub draft written: %s (%.1fs)", draft_path.name, elapsed)
+            end_doc(status="ok")
             continue
 
         # Gather source material within context budget
@@ -521,6 +536,7 @@ def compile_concepts(
         )
         if not resolved_paths:
             log.warning("No readable sources for concept '%s', skipping", name)
+            end_doc(status="failed", error="no readable sources")
             failed.append(name)
             continue
 
@@ -566,6 +582,7 @@ def compile_concepts(
             )
         except (StructuredOutputError, LLMBadRequestError) as e:
             log.error("Failed to write '%s': %s", name, e)
+            end_doc(status="failed", error=str(e))
             failed.append(name)
             continue
 
@@ -585,6 +602,7 @@ def compile_concepts(
         elapsed = time.monotonic() - _t_concept
         concept_timings[name] = elapsed
         log.info("Draft written: %s (%.1fs)", draft_path.name, elapsed)
+        end_doc(status="ok")
 
     # Mark all sources that fed any compiled concept as 'compiled'
     for sp in compiled_sources:
@@ -759,8 +777,8 @@ def compile_notes(
         if existing_path.exists():
             try:
                 existing_meta, _ = parse_note(existing_path)
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("Could not read existing metadata for '%s': %s", article.path, e)
 
         confidence = _compute_confidence(resolved_paths, db)
         draft_path = _write_draft(
@@ -846,8 +864,8 @@ def approve_drafts(
                         is_draft=False,
                     )
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                log.warning("Could not update content hash for '%s': %s — manual-edit detection may be unreliable", target_rel, e)
             db.approve_article(target_rel, notes=notes)
 
         published.append(target)
@@ -884,8 +902,8 @@ def reject_draft(
         try:
             meta, draft_body = parse_note(draft_path)
             title = meta.get("title", draft_path.stem)
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("Could not parse draft '%s' for rejection record: %s", draft_path.name, e)
 
     draft_rel = str(draft_path.relative_to(config.vault))
     db.delete_article(draft_rel)

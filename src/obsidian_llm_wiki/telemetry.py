@@ -28,6 +28,21 @@ def emit_event(config: Config | None, **event: Any) -> dict[str, Any]:
         "telemetry_version": 1,
         **event,
     }
+
+    # Forward token counts to per-doc analytics accumulator (thread-local).
+    if event.get("success") and event.get("event_type") == "provider_request":
+        try:
+            from .analytics import accumulate_tokens
+
+            accumulate_tokens(
+                input_tokens=event.get("input_tokens", 0) or 0,
+                output_tokens=event.get("output_tokens", 0) or 0,
+                model=event.get("model", "") or "",
+                provider=event.get("provider", "") or "",
+            )
+        except Exception:
+            pass
+
     if config is None or not config.pipeline.telemetry_enabled:
         return payload
 

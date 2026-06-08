@@ -9,11 +9,14 @@ This is separate from the per-vault wiki.toml. It stores user preferences
 
 from __future__ import annotations
 
+import logging
 import os
 import tomllib
 from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict
+
+log = logging.getLogger(__name__)
 
 
 class GlobalConfig(BaseModel):
@@ -47,7 +50,8 @@ def load_global_config() -> GlobalConfig | None:
         with open(path, "rb") as f:
             data = tomllib.load(f)
         return GlobalConfig(**data)
-    except Exception:
+    except Exception as e:
+        log.warning("Global config at %s is malformed and will be ignored: %s", path, e)
         return None
 
 

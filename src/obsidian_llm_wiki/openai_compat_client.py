@@ -296,7 +296,8 @@ class OpenAICompatClient:
             raise self._wrap_error(e) from e
 
         try:
-            text = resp.json()["choices"][0]["message"]["content"]
+            _resp_json = resp.json()
+            text = _resp_json["choices"][0]["message"]["content"]
         except (KeyError, IndexError, ValueError) as e:
             emit_event(
                 telemetry_config,
@@ -318,6 +319,10 @@ class OpenAICompatClient:
                 f"{self.provider_name}: unexpected response format: {resp.text[:200]}"
             ) from e
 
+        _usage = _resp_json.get("usage") or {}
+        _input_tokens = _usage.get("prompt_tokens", 0)
+        _output_tokens = _usage.get("completion_tokens", 0)
+
         emit_event(
             telemetry_config,
             event_type="provider_request",
@@ -332,6 +337,8 @@ class OpenAICompatClient:
             prompt_chars=len(prompt),
             response_chars=len(text),
             downgrade_count=downgrade_count,
+            input_tokens=_input_tokens,
+            output_tokens=_output_tokens,
         )
         return text
 

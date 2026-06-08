@@ -121,6 +121,8 @@ class OllamaClient:
             resp.raise_for_status()
             data = resp.json()
             text = data.get("response") or data.get("thinking", "")
+            _input_tokens = data.get("prompt_eval_count", 0) or 0
+            _output_tokens = data.get("eval_count", 0) or 0
         except httpx.ConnectError:
             emit_event(
                 telemetry_config,
@@ -187,6 +189,8 @@ class OllamaClient:
             num_predict=num_predict,
             prompt_chars=len(prompt),
             response_chars=len(text),
+            input_tokens=_input_tokens,
+            output_tokens=_output_tokens,
         )
         return text
 

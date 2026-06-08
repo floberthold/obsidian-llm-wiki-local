@@ -23,6 +23,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Callable
 
+from ..analytics import AnalyticsCollector, set_active_collector
 from ..config import Config
 from ..protocols import LLMClientProtocol
 from ..state import StateDB
@@ -82,6 +83,7 @@ class PipelineOrchestrator:
         max_rounds: int = 2,
         dry_run: bool = False,
         on_progress: Callable[[str, int, int, float | None, str], None] | None = None,
+        analytics_jsonl_path: str | None = None,
     ) -> PipelineReport:
         """
         Run full pipeline: ingest → compile → lint → [stubs] → [approve] → [bundles].
@@ -109,6 +111,9 @@ class PipelineOrchestrator:
         client = self.client
         db = self.db
         report = PipelineReport()
+
+        collector = AnalyticsCollector(db, config, "run")
+        set_active_collector(collector)
 
         # ── Round 1: Ingest ────────────────────────────────────────────────────
         t0 = time.monotonic()
@@ -390,6 +395,18 @@ class PipelineOrchestrator:
             if report.bundles_created:
                 msg += f", {report.bundles_created} bundles"
             git_commit(config.vault, msg, paths=["wiki/", ".olw/"])
+
+        # ── Analytics flush ────────────────────────────────────────────────────
+        set_active_collector(None)
+        if not dry_run:
+            try:
+                jsonl_path = (
+                    Path(analytics_jsonl_path) if analytics_jsonl_path else None
+                )
+                collector.flush(jsonl_path=jsonl_path)
+                log.info("Analytics: %s", collector.summary_line())
+            except Exception as e:
+                log.debug("Analytics flush failed: %s", e)
 
         return report
 

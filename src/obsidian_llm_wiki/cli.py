@@ -665,6 +665,7 @@ def ingest(vault_str, ingest_all, force, paths):
 
     config = _load_config(vault_str)
     client, db = _load_deps(config)
+    from .analytics import AnalyticsCollector, set_active_collector
     from .pipeline.ingest import collect_ingest_paths as _collect_ingest_paths
 
     if ingest_all:
@@ -679,10 +680,44 @@ def ingest(vault_str, ingest_all, force, paths):
         console.print("[yellow]No notes found in raw/[/yellow]")
         return
 
-    skipped = ingested = failed = 0
+    _ingest_collector = AnalyticsCollector(db, config, "ingest")
+    set_active_collector(_ingest_collector)
+
     durations: list[float] = []
     processed_durations: list[float] = []
     total_paths = len(target_paths)
+
+    # Pre-scan: classify files by hash before showing the progress bar so that
+    # the bar opens at the correct position and the ETA only counts new work.
+    from .pipeline.ingest import _content_hash, ingest_note as _ingest_note
+    from .vault import parse_note as _parse_note
+
+    confirmed_done: list[Path] = []
+    to_process: list[Path] = []
+
+    if not force:
+        ingested_recs = {rec.path: rec.content_hash for rec in db.list_raw(status="ingested")}
+        console.print(f"[dim]Scanning {total_paths} files…[/dim]", end="\r")
+        for path in target_paths:
+            rel = path.relative_to(config.vault).as_posix()
+            if rel in ingested_recs:
+                try:
+                    meta, body = _parse_note(path)
+                    source_pdf = meta.get("source_pdf", "")
+                    hash_input = (source_pdf + "\x00" + body) if source_pdf else body
+                    if _content_hash(hash_input) == ingested_recs[rel]:
+                        confirmed_done.append(path)
+                        continue
+                except Exception:
+                    pass
+            to_process.append(path)
+    else:
+        to_process = list(target_paths)
+
+    pre_done_count = len(confirmed_done)
+    new_count = len(to_process)
+    skipped = pre_done_count
+    ingested = failed = 0
 
     try:
         with Progress(
@@ -693,17 +728,16 @@ def ingest(vault_str, ingest_all, force, paths):
             TimeElapsedColumn(),
             console=console,
         ) as progress:
-            task = progress.add_task("Ingesting...", total=len(target_paths))
+            task = progress.add_task("Ingesting...", total=total_paths, completed=pre_done_count)
 
-            for idx, path in enumerate(target_paths, 1):
+            for new_idx, path in enumerate(to_process, 1):
                 step_t0 = time.monotonic()
+                overall_pct = (pre_done_count + new_idx - 1) / total_paths * 100
                 progress.update(
                     task,
-                    description=f"[dim]{path.name} | {((idx - 1) / total_paths) * 100:5.1f}%"
+                    description=f"[dim]{path.name} | {overall_pct:5.1f}%"
                     f" | ETA {_format_eta(None)}[/dim]",
                 )
-                from .pipeline.ingest import ingest_note as _ingest_note
-
                 result = _ingest_note(
                     path=path,
                     config=config,
@@ -725,19 +759,28 @@ def ingest(vault_str, ingest_all, force, paths):
                 durations.append(elapsed)
                 if result is not None:
                     processed_durations.append(elapsed)
+                # ETA counts down against new files only, not pre-done skips
                 eta = None
-                if idx < total_paths and durations:
+                if new_idx < new_count and durations:
                     basis = processed_durations or durations
-                    eta = (sum(basis) / len(basis)) * (total_paths - idx)
+                    eta = (sum(basis) / len(basis)) * (new_count - new_idx)
+                overall_pct = (pre_done_count + new_idx) / total_paths * 100
                 progress.update(
                     task,
-                    description=f"[dim]{path.name} | {(idx / total_paths) * 100:5.1f}%"
+                    description=f"[dim]{path.name} | {overall_pct:5.1f}%"
                     f" | ETA {_format_eta(eta)}[/dim]",
                 )
                 progress.advance(task)
     except KeyboardInterrupt:
         console.print("\n[yellow]Ingest interrupted.[/yellow]")
         sys.exit(130)
+    finally:
+        set_active_collector(None)
+        try:
+            _jsonl = config.vault / ".olw" / "analytics.jsonl"
+            _ingest_collector.flush(jsonl_path=_jsonl)
+        except Exception:
+            pass
 
     console.print(
         f"[green]Done.[/green] Ingested: {ingested}  Skipped: {skipped}  Failed: {failed}"
@@ -778,11 +821,14 @@ def ingest(vault_str, ingest_all, force, paths):
 )
 def compile(vault_str, dry_run, auto_approve, force, legacy, retry_failed):
     """Synthesize ingested notes into wiki article drafts."""
+    from .analytics import AnalyticsCollector, set_active_collector
     from .git_ops import git_commit
     from .pipeline.compile import approve_drafts, compile_concepts, compile_notes
 
     config = _load_config(vault_str)
     client, db = _load_deps(config)
+    _compile_collector = AnalyticsCollector(db, config, "compile")
+    set_active_collector(_compile_collector)
 
     # Re-ingest previously failed notes before compiling
     if retry_failed:
@@ -859,6 +905,13 @@ def compile(vault_str, dry_run, auto_approve, force, legacy, retry_failed):
                 completed=final_total,
                 description=f"[dim]Done | 100.0% | ETA {_format_eta(0)}[/dim]",
             )
+
+    set_active_collector(None)
+    try:
+        _jsonl = config.vault / ".olw" / "analytics.jsonl"
+        _compile_collector.flush(jsonl_path=None if dry_run else _jsonl)
+    except Exception:
+        pass
 
     if dry_run:
         return
@@ -1220,6 +1273,193 @@ def doctor(vault_str):
         console.print("[yellow][bold]Some checks need attention (see above).[/bold][/yellow]")
 
 
+# ── config ───────────────────────────────────────────────────────────────────
+
+
+@cli.group()
+def config():
+    """Inspect and validate olw configuration."""
+
+
+@config.command("show")
+@click.option("--vault", "vault_str", envvar="OLW_VAULT", default=None)
+def config_show(vault_str):
+    """Show effective merged configuration (global + vault wiki.toml)."""
+    from .config import Config
+    from .global_config import GlobalConfig, _global_config_path, load_global_config
+
+    # ── Global config ─────────────────────────────────────────────────────────
+    gcfg_path = _global_config_path()
+    console.print("[bold]Global config[/bold]", f"[dim]{gcfg_path}[/dim]")
+    gcfg: GlobalConfig | None = load_global_config()
+    if not gcfg_path.exists():
+        console.print("  [dim](not found — defaults used)[/dim]")
+    elif gcfg is None:
+        console.print("  [red]✗ malformed — see warning above[/red]")
+    else:
+        g_table = Table(show_header=False, box=None, padding=(0, 2))
+        for field, val in gcfg.model_dump(exclude_none=True).items():
+            display = "****" if field == "api_key" else str(val)
+            g_table.add_row(f"[dim]{field}[/dim]", display)
+        if g_table.row_count:
+            console.print(g_table)
+        else:
+            console.print("  [dim](empty — all defaults)[/dim]")
+
+    # ── Vault config ──────────────────────────────────────────────────────────
+    console.print()
+    if vault_str is None and gcfg and gcfg.vault:
+        vault_str = gcfg.vault
+    if vault_str is None:
+        # Try auto-detect
+        cwd = Path.cwd()
+        for parent in [cwd, *cwd.parents]:
+            if (parent / "wiki.toml").exists():
+                vault_str = str(parent)
+                break
+
+    if vault_str is None:
+        console.print("[bold]Vault config[/bold]  [dim](no vault — use --vault or cd into one)[/dim]")
+        return
+
+    vault_path = Path(vault_str).expanduser().resolve()
+    toml_path = vault_path / "wiki.toml"
+    console.print("[bold]Vault config[/bold]", f"[dim]{toml_path}[/dim]")
+
+    if not toml_path.exists():
+        console.print("  [yellow]! wiki.toml not found — run olw init[/yellow]")
+        return
+
+    try:
+        cfg = Config.from_vault(vault_path)
+    except Exception as e:
+        console.print(f"  [red]✗ failed to load: {e}[/red]")
+        return
+
+    prov = cfg.effective_provider
+    v_table = Table(show_header=False, box=None, padding=(0, 2))
+    v_table.add_row("[dim]models.fast[/dim]", cfg.models.fast)
+    v_table.add_row("[dim]models.heavy[/dim]", cfg.models.heavy)
+    v_table.add_row("[dim]provider.name[/dim]", prov.name)
+    v_table.add_row("[dim]provider.url[/dim]", prov.url)
+    v_table.add_row("[dim]provider.timeout[/dim]", f"{prov.timeout:.0f}s")
+    v_table.add_row("[dim]provider.fast_ctx[/dim]", str(prov.fast_ctx))
+    v_table.add_row("[dim]provider.heavy_ctx[/dim]", str(prov.heavy_ctx))
+    v_table.add_row("[dim]pipeline.auto_approve[/dim]", str(cfg.pipeline.auto_approve))
+    v_table.add_row("[dim]pipeline.auto_commit[/dim]", str(cfg.pipeline.auto_commit))
+    v_table.add_row("[dim]pipeline.ingest_parallel[/dim]", str(cfg.pipeline.ingest_parallel))
+    v_table.add_row("[dim]pipeline.language[/dim]", cfg.pipeline.language or "(auto-detect)")
+    v_table.add_row("[dim]pipeline.telemetry_enabled[/dim]", str(cfg.pipeline.telemetry_enabled))
+    console.print(v_table)
+
+
+@config.command("validate")
+@click.option("--vault", "vault_str", envvar="OLW_VAULT", default=None)
+def config_validate(vault_str):
+    """Check wiki.toml for unknown keys, type errors, and missing values."""
+    import tomllib
+
+    from .config import (
+        ModelsConfig,
+        OllamaConfig,
+        PipelineConfig,
+        ProviderConfig,
+        RagConfig,
+    )
+    from .global_config import GlobalConfig, _global_config_path, load_global_config
+
+    issues: list[str] = []
+    ok_msgs: list[str] = []
+
+    # ── Global config ─────────────────────────────────────────────────────────
+    gcfg_path = _global_config_path()
+    console.print("[bold]Validating global config[/bold]", f"[dim]{gcfg_path}[/dim]")
+    if not gcfg_path.exists():
+        console.print("  [dim]Not found — OK (optional)[/dim]")
+    else:
+        try:
+            with open(gcfg_path, "rb") as f:
+                raw_gcfg = tomllib.load(f)
+            known_global = set(GlobalConfig.model_fields.keys())
+            for key in raw_gcfg:
+                if key not in known_global:
+                    issues.append(f"global config: unknown key [bold]{key!r}[/bold] (typo?)")
+            GlobalConfig(**raw_gcfg)
+            ok_msgs.append("global config syntax OK")
+        except Exception as e:
+            issues.append(f"global config: {e}")
+
+    # ── Vault config ──────────────────────────────────────────────────────────
+    if vault_str is None:
+        gcfg = load_global_config()
+        if gcfg and gcfg.vault:
+            vault_str = gcfg.vault
+    if vault_str is None:
+        cwd = Path.cwd()
+        for parent in [cwd, *cwd.parents]:
+            if (parent / "wiki.toml").exists():
+                vault_str = str(parent)
+                break
+
+    console.print()
+    if vault_str is None:
+        console.print("[dim]No vault to validate — use --vault or cd into one.[/dim]")
+    else:
+        vault_path = Path(vault_str).expanduser().resolve()
+        toml_path = vault_path / "wiki.toml"
+        console.print("[bold]Validating vault config[/bold]", f"[dim]{toml_path}[/dim]")
+
+        if not toml_path.exists():
+            issues.append("wiki.toml not found — run olw init")
+        else:
+            try:
+                with open(toml_path, "rb") as f:
+                    raw = tomllib.load(f)
+
+                known_top = {"models", "ollama", "provider", "pipeline", "rag"}
+                section_models = {
+                    "models": set(ModelsConfig.model_fields.keys()),
+                    "ollama": set(OllamaConfig.model_fields.keys()),
+                    "provider": set(ProviderConfig.model_fields.keys()),
+                    "pipeline": set(PipelineConfig.model_fields.keys()),
+                    "rag": set(RagConfig.model_fields.keys()),
+                }
+
+                for key in raw:
+                    if key not in known_top:
+                        issues.append(f"wiki.toml: unknown top-level key [bold]{key!r}[/bold] (typo?)")
+
+                for section, known_keys in section_models.items():
+                    if section in raw and isinstance(raw[section], dict):
+                        for k in raw[section]:
+                            if k not in known_keys:
+                                issues.append(
+                                    f"wiki.toml [{section}]: unknown key [bold]{k!r}[/bold]"
+                                    f" — did you mean one of: {', '.join(sorted(known_keys)[:5])}?"
+                                )
+
+                # Full load validation
+                from .config import Config
+                Config.from_vault(vault_path)
+                ok_msgs.append("wiki.toml syntax and schema OK")
+
+            except Exception as e:
+                issues.append(f"wiki.toml: {e}")
+
+    # ── Report ────────────────────────────────────────────────────────────────
+    console.print()
+    for msg in ok_msgs:
+        console.print(f"  [green]✓[/green] {msg}")
+    for issue in issues:
+        console.print(f"  [red]✗[/red] {issue}")
+
+    if not issues:
+        console.print("\n[green][bold]All checks passed.[/bold][/green]")
+    else:
+        console.print(f"\n[red][bold]{len(issues)} issue(s) found.[/bold][/red]")
+        sys.exit(1)
+
+
 # ── query ─────────────────────────────────────────────────────────────────────
 
 
@@ -1290,6 +1530,131 @@ def lint(vault_str, fix):
         fixed = sum(1 for i in result.issues if i.auto_fixable)
         if fixed:
             console.print(f"[green]Auto-fixed {fixed} issue(s).[/green]")
+
+
+# ── metrics ──────────────────────────────────────────────────────────────────
+
+
+@cli.command()
+@click.option("--vault", "vault_str", envvar="OLW_VAULT", default=None)
+@click.option("--last", default=0, help="Limit to last N events (0 = all)")
+def metrics(vault_str, last):
+    """Summarise telemetry: LLM success rates, latency, slowest concepts."""
+    import json
+
+    from .telemetry import resolve_metrics_path
+
+    config = _load_config(vault_str)
+    metrics_path = resolve_metrics_path(config)
+
+    if not metrics_path.exists():
+        console.print(f"[yellow]No telemetry file found at {metrics_path}[/yellow]")
+        console.print("[dim]Telemetry is written when pipeline runs with telemetry_enabled = true.[/dim]")
+        return
+
+    events: list[dict] = []
+    with metrics_path.open(encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                try:
+                    events.append(json.loads(line))
+                except json.JSONDecodeError:
+                    pass
+
+    if last:
+        events = events[-last:]
+
+    if not events:
+        console.print("[dim]No events in telemetry file.[/dim]")
+        return
+
+    console.print(f"[bold]Telemetry summary[/bold]  [dim]{metrics_path}[/dim]")
+    console.print(f"[dim]{len(events)} event(s){f', last {last}' if last else ''}[/dim]\n")
+
+    # ── LLM request stats ─────────────────────────────────────────────────────
+    llm_events = [e for e in events if e.get("event_type") == "llm_request"]
+    if llm_events:
+        total = len(llm_events)
+        successes = sum(1 for e in llm_events if e.get("success"))
+        failures = total - successes
+        latencies = [e["elapsed_ms"] for e in llm_events if e.get("elapsed_ms") and e.get("success")]
+        avg_ms = sum(latencies) / len(latencies) if latencies else 0
+        p95_ms = sorted(latencies)[int(len(latencies) * 0.95)] if latencies else 0
+
+        console.print("[bold]LLM requests[/bold]")
+        req_table = Table(show_header=False, box=None, padding=(0, 2))
+        req_table.add_row("total", str(total))
+        req_table.add_row("success", f"[green]{successes}[/green]")
+        req_table.add_row("failed", f"[{'red' if failures else 'dim'}]{failures}[/{'red' if failures else 'dim'}]")
+        req_table.add_row(
+            "success rate",
+            f"{'[green]' if successes / total >= 0.9 else '[yellow]'}{successes / total:.0%}[/{'green' if successes / total >= 0.9 else 'yellow'}]",
+        )
+        if latencies:
+            req_table.add_row("avg latency", f"{avg_ms:.0f} ms")
+            req_table.add_row("p95 latency", f"{p95_ms:.0f} ms")
+        console.print(req_table)
+
+        # By stage
+        stages: dict[str, dict[str, int]] = {}
+        for e in llm_events:
+            stage = e.get("stage", "unknown")
+            stages.setdefault(stage, {"ok": 0, "fail": 0})
+            if e.get("success"):
+                stages[stage]["ok"] += 1
+            else:
+                stages[stage]["fail"] += 1
+
+        if len(stages) > 1:
+            console.print("\n[bold]By stage[/bold]")
+            st_table = Table("stage", "ok", "fail", "rate", box=None, padding=(0, 2))
+            for stage, counts in sorted(stages.items()):
+                stotal = counts["ok"] + counts["fail"]
+                rate = counts["ok"] / stotal
+                color = "green" if rate >= 0.9 else "yellow" if rate >= 0.7 else "red"
+                st_table.add_row(
+                    stage,
+                    str(counts["ok"]),
+                    str(counts["fail"]),
+                    f"[{color}]{rate:.0%}[/{color}]",
+                )
+            console.print(st_table)
+
+    # ── Function timings ──────────────────────────────────────────────────────
+    timing_events = [e for e in events if e.get("event_type") == "function_timing"]
+    if timing_events:
+        console.print("\n[bold]Pipeline timings[/bold]")
+        fn_times: dict[str, list[float]] = {}
+        for e in timing_events:
+            fn = e.get("function_name", "unknown")
+            dur = e.get("duration_s")
+            if dur is not None:
+                fn_times.setdefault(fn, []).append(float(dur))
+
+        tm_table = Table("function", "runs", "avg (s)", "max (s)", box=None, padding=(0, 2))
+        for fn, times in sorted(fn_times.items()):
+            tm_table.add_row(
+                fn,
+                str(len(times)),
+                f"{sum(times) / len(times):.1f}",
+                f"{max(times):.1f}",
+            )
+        console.print(tm_table)
+
+    # ── Recent failures ───────────────────────────────────────────────────────
+    recent_failures = [e for e in llm_events[-50:] if not e.get("success")]
+    if recent_failures:
+        console.print(f"\n[bold]Recent failures[/bold]  [dim](last {len(recent_failures)} of 50 checked)[/dim]")
+        fail_table = Table("stage", "model", "timestamp", box=None, padding=(0, 2))
+        for e in recent_failures[-10:]:
+            ts = e.get("timestamp", "")[:19].replace("T", " ")
+            fail_table.add_row(
+                e.get("stage", "?"),
+                e.get("model", "?"),
+                ts,
+            )
+        console.print(fail_table)
 
 
 # ── watch ─────────────────────────────────────────────────────────────────────
@@ -1420,6 +1785,7 @@ def run(vault_str, auto_approve, skip_bundles, fix, max_rounds, dry_run):
                     max_rounds=max_rounds,
                     dry_run=dry_run,
                     on_progress=_on_progress,
+                    analytics_jsonl_path=str(config.vault / ".olw" / "analytics.jsonl"),
                 )
                 progress.update(
                     task,
@@ -1805,3 +2171,143 @@ def unblock(vault_str, concept):
     console.print(
         f"[dim]{count} rejection(s) remain on record. Next compile will include this concept.[/dim]"
     )
+
+
+# ── analytics ─────────────────────────────────────────────────────────────────
+
+
+@cli.command()
+@click.option("--vault", "vault_str", envvar="OLW_VAULT", default=None)
+@click.option("--export", "export_path", default=None, help="Re-export analytics.jsonl to path")
+def analytics(vault_str, export_path):
+    """Show token usage, timing, and vault growth analytics."""
+    from .analytics import _export_jsonl, get_summary
+
+    config = _load_config(vault_str)
+    db = _load_db(config)
+    summary = get_summary(db)
+
+    if export_path:
+        from pathlib import Path as _Path
+
+        _export_jsonl(db._conn, _Path(export_path))
+        console.print(f"[green]Exported to {export_path}[/green]")
+        return
+
+    # ── All-time totals ──────────────────────────────────────────────────────
+    at = summary.get("all_time") or {}
+    total_tokens = (at.get("total_tokens") or 0)
+    total_in = (at.get("total_input_tokens") or 0)
+    total_out = (at.get("total_output_tokens") or 0)
+    total_runs = at.get("total_runs") or 0
+    total_docs = at.get("total_docs") or 0
+    total_concepts = at.get("total_concepts") or 0
+    total_secs = at.get("total_seconds") or 0.0
+
+    totals = Table(title="All-time Totals", show_header=False, box=None, padding=(0, 2))
+    totals.add_column("Key", style="bold")
+    totals.add_column("Value")
+    totals.add_row("Runs", str(total_runs))
+    totals.add_row("Docs ingested", f"{total_docs:,}")
+    totals.add_row("Concepts compiled", f"{total_concepts:,}")
+    totals.add_row("Input tokens", f"{total_in:,}")
+    totals.add_row("Output tokens", f"{total_out:,}")
+    totals.add_row("Total tokens", f"{total_tokens:,}")
+    totals.add_row("Total wall time", f"{total_secs / 3600:.2f} h" if total_secs > 3600 else f"{total_secs:.0f}s")
+    console.print(totals)
+    console.print()
+
+    # ── Recent runs ──────────────────────────────────────────────────────────
+    runs = summary.get("recent_runs") or []
+    if runs:
+        rt = Table(title="Recent Runs (newest first)", show_header=True)
+        rt.add_column("Date", style="dim")
+        rt.add_column("Step")
+        rt.add_column("Docs", justify="right")
+        rt.add_column("Concepts", justify="right")
+        rt.add_column("In tok", justify="right")
+        rt.add_column("Out tok", justify="right")
+        rt.add_column("Time", justify="right")
+        rt.add_column("Model", style="dim")
+        for r in runs:
+            dur_s = (r.get("duration_ms") or 0) / 1000
+            dur_str = f"{dur_s:.0f}s" if dur_s < 3600 else f"{dur_s / 3600:.1f}h"
+            rt.add_row(
+                (r.get("started_at") or "")[:16],
+                r.get("pipeline_step") or "",
+                str(r.get("docs_processed") or 0),
+                str(r.get("concepts_compiled") or 0),
+                f'{r.get("total_input_tokens") or 0:,}',
+                f'{r.get("total_output_tokens") or 0:,}',
+                dur_str,
+                r.get("fast_model") or r.get("provider") or "",
+            )
+        console.print(rt)
+        console.print()
+
+    # ── Top 10 slowest docs ──────────────────────────────────────────────────
+    slow = summary.get("top_slow_docs") or []
+    if slow:
+        st = Table(title="Top 10 Slowest Documents", show_header=True)
+        st.add_column("Document", style="dim", max_width=50)
+        st.add_column("Step")
+        st.add_column("Time", justify="right")
+        st.add_column("In tok", justify="right")
+        st.add_column("Out tok", justify="right")
+        st.add_column("Chunks", justify="right")
+        for d in slow:
+            dur_s = (d.get("duration_ms") or 0) / 1000
+            st.add_row(
+                (d.get("doc_path") or "").split("/")[-1],
+                d.get("pipeline_step") or "",
+                f"{dur_s:.1f}s",
+                f'{d.get("input_tokens") or 0:,}',
+                f'{d.get("output_tokens") or 0:,}',
+                str(d.get("chunk_count") or 1),
+            )
+        console.print(st)
+        console.print()
+
+    # ── Efficiency trend ─────────────────────────────────────────────────────
+    trend = summary.get("efficiency_trend") or []
+    if len(trend) > 1:
+        et = Table(title="Efficiency Trend (newest first)", show_header=True)
+        et.add_column("Date", style="dim")
+        et.add_column("Step")
+        et.add_column("Tok/doc", justify="right")
+        et.add_column("ms/doc", justify="right")
+        for r in trend:
+            n = (r.get("docs_processed") or 0) + (r.get("concepts_compiled") or 0)
+            if n == 0:
+                continue
+            tok_per = ((r.get("total_input_tokens") or 0) + (r.get("total_output_tokens") or 0)) // n
+            ms_per = (r.get("duration_ms") or 0) // n
+            et.add_row(
+                (r.get("started_at") or "")[:16],
+                r.get("pipeline_step") or "",
+                f"{tok_per:,}",
+                f"{ms_per:,}",
+            )
+        console.print(et)
+        console.print()
+
+    # ── Machines ─────────────────────────────────────────────────────────────
+    machines = summary.get("machines") or []
+    if machines:
+        mt = Table(title="Known Machines", show_header=True)
+        mt.add_column("Host")
+        mt.add_column("CPU")
+        mt.add_column("Cores", justify="right")
+        mt.add_column("RAM", justify="right")
+        mt.add_column("GPU")
+        mt.add_column("Last seen", style="dim")
+        for m in machines:
+            mt.add_row(
+                m.get("hostname") or "",
+                (m.get("cpu_model") or "")[:30],
+                str(m.get("cpu_cores") or ""),
+                f'{m.get("ram_gb") or 0:.0f} GB',
+                m.get("gpu_model") or "—",
+                (m.get("last_seen_at") or "")[:16],
+            )
+        console.print(mt)

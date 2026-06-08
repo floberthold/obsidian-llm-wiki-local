@@ -9,6 +9,7 @@ Schema versioning: schema_version table tracks migration level.
   v2 — rejections, stubs, blocked_concepts tables; approved_at/approval_notes on wiki_articles
   v3 — language column on raw_notes
   v4 — concept_aliases table; backfill from existing concept titles
+  v5 — analytics tables: machine_profiles, pipeline_runs, doc_metrics
 """
 
 from __future__ import annotations
@@ -21,7 +22,7 @@ from pathlib import Path
 
 from .models import RawNoteRecord, WikiArticleRecord
 
-_CURRENT_SCHEMA_VERSION = 4
+_CURRENT_SCHEMA_VERSION = 5
 
 # Full current schema — idempotent (CREATE IF NOT EXISTS).
 # Fresh DBs get all tables + columns from here. Existing DBs use _VERSIONED_MIGRATIONS.
@@ -86,11 +87,61 @@ CREATE TABLE IF NOT EXISTS concept_aliases (
     PRIMARY KEY (concept_name, alias)
 );
 
+CREATE TABLE IF NOT EXISTS machine_profiles (
+    id             TEXT PRIMARY KEY,
+    hostname       TEXT,
+    cpu_model      TEXT,
+    cpu_cores      INTEGER,
+    ram_gb         REAL,
+    gpu_model      TEXT,
+    gpu_vram_gb    REAL,
+    os_platform    TEXT,
+    python_version TEXT,
+    first_seen_at  TEXT NOT NULL,
+    last_seen_at   TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS pipeline_runs (
+    run_id              TEXT PRIMARY KEY,
+    machine_id          TEXT REFERENCES machine_profiles(id),
+    pipeline_step       TEXT NOT NULL,
+    started_at          TEXT NOT NULL,
+    finished_at         TEXT,
+    duration_ms         INTEGER,
+    docs_processed      INTEGER NOT NULL DEFAULT 0,
+    concepts_compiled   INTEGER NOT NULL DEFAULT 0,
+    total_input_tokens  INTEGER NOT NULL DEFAULT 0,
+    total_output_tokens INTEGER NOT NULL DEFAULT 0,
+    fast_model          TEXT,
+    heavy_model         TEXT,
+    provider            TEXT,
+    config_snapshot     TEXT
+);
+
+CREATE TABLE IF NOT EXISTS doc_metrics (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id        TEXT NOT NULL REFERENCES pipeline_runs(run_id),
+    doc_path      TEXT NOT NULL,
+    pipeline_step TEXT NOT NULL,
+    started_at    TEXT NOT NULL,
+    duration_ms   INTEGER NOT NULL DEFAULT 0,
+    input_tokens  INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    chunk_count   INTEGER NOT NULL DEFAULT 1,
+    model         TEXT,
+    provider      TEXT,
+    status        TEXT NOT NULL DEFAULT 'ok',
+    error         TEXT
+);
+
 CREATE INDEX IF NOT EXISTS idx_raw_hash ON raw_notes(content_hash);
 CREATE INDEX IF NOT EXISTS idx_raw_status ON raw_notes(status);
 CREATE INDEX IF NOT EXISTS idx_concept_name ON concepts(name);
 CREATE INDEX IF NOT EXISTS idx_rejections_concept ON rejections(concept);
 CREATE INDEX IF NOT EXISTS idx_alias_lookup ON concept_aliases(lower(alias));
+CREATE INDEX IF NOT EXISTS idx_doc_metrics_run ON doc_metrics(run_id);
+CREATE INDEX IF NOT EXISTS idx_doc_metrics_path ON doc_metrics(doc_path);
+CREATE INDEX IF NOT EXISTS idx_pipeline_runs_started ON pipeline_runs(started_at);
 """
 
 # Migrations keyed by version they bring the DB to.
@@ -132,6 +183,55 @@ _VERSIONED_MIGRATIONS: dict[int, list[str]] = {
                PRIMARY KEY (concept_name, alias)
            )""",
         "CREATE INDEX IF NOT EXISTS idx_alias_lookup ON concept_aliases(lower(alias))",
+    ],
+    5: [
+        """CREATE TABLE IF NOT EXISTS machine_profiles (
+               id             TEXT PRIMARY KEY,
+               hostname       TEXT,
+               cpu_model      TEXT,
+               cpu_cores      INTEGER,
+               ram_gb         REAL,
+               gpu_model      TEXT,
+               gpu_vram_gb    REAL,
+               os_platform    TEXT,
+               python_version TEXT,
+               first_seen_at  TEXT NOT NULL,
+               last_seen_at   TEXT NOT NULL
+           )""",
+        """CREATE TABLE IF NOT EXISTS pipeline_runs (
+               run_id              TEXT PRIMARY KEY,
+               machine_id          TEXT REFERENCES machine_profiles(id),
+               pipeline_step       TEXT NOT NULL,
+               started_at          TEXT NOT NULL,
+               finished_at         TEXT,
+               duration_ms         INTEGER,
+               docs_processed      INTEGER NOT NULL DEFAULT 0,
+               concepts_compiled   INTEGER NOT NULL DEFAULT 0,
+               total_input_tokens  INTEGER NOT NULL DEFAULT 0,
+               total_output_tokens INTEGER NOT NULL DEFAULT 0,
+               fast_model          TEXT,
+               heavy_model         TEXT,
+               provider            TEXT,
+               config_snapshot     TEXT
+           )""",
+        """CREATE TABLE IF NOT EXISTS doc_metrics (
+               id            INTEGER PRIMARY KEY AUTOINCREMENT,
+               run_id        TEXT NOT NULL REFERENCES pipeline_runs(run_id),
+               doc_path      TEXT NOT NULL,
+               pipeline_step TEXT NOT NULL,
+               started_at    TEXT NOT NULL,
+               duration_ms   INTEGER NOT NULL DEFAULT 0,
+               input_tokens  INTEGER NOT NULL DEFAULT 0,
+               output_tokens INTEGER NOT NULL DEFAULT 0,
+               chunk_count   INTEGER NOT NULL DEFAULT 1,
+               model         TEXT,
+               provider      TEXT,
+               status        TEXT NOT NULL DEFAULT 'ok',
+               error         TEXT
+           )""",
+        "CREATE INDEX IF NOT EXISTS idx_doc_metrics_run ON doc_metrics(run_id)",
+        "CREATE INDEX IF NOT EXISTS idx_doc_metrics_path ON doc_metrics(doc_path)",
+        "CREATE INDEX IF NOT EXISTS idx_pipeline_runs_started ON pipeline_runs(started_at)",
     ],
 }
 
