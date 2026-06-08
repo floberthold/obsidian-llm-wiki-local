@@ -96,7 +96,12 @@ class PipelineOrchestrator:
         from ..git_ops import git_commit
         from ..indexer import append_log, generate_index
         from ..pipeline.compile import approve_drafts
-        from ..pipeline.ingest import collect_ingest_paths, ingest_note
+        from ..pipeline.ingest import (
+            _find_document_source_dirs,
+            _write_document_aggregate,
+            collect_ingest_paths,
+            ingest_note,
+        )
         from ..pipeline.lint import run_lint
         from ..pipeline.maintain import create_stubs
 
@@ -262,6 +267,13 @@ class PipelineOrchestrator:
                     executor.shutdown(wait=True)
 
         report.timings["ingest"] = time.monotonic() - t0
+
+        if not dry_run:
+            for doc_dir in _find_document_source_dirs(config):
+                try:
+                    _write_document_aggregate(doc_dir, config, db)
+                except Exception as e:
+                    log.warning("Document aggregate failed for %s: %s", doc_dir.name, e)
 
         if not dry_run and report.ingested > 0:
             generate_index(config, db)

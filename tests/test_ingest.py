@@ -17,10 +17,12 @@ from obsidian_llm_wiki.pipeline.ingest import (
     _analyze_body,
     _build_analysis_prompt,
     _conversion_output_dir,
+    _find_document_source_dirs,
     _merge_chunk_results,
     _normalize_concepts,
     _preprocess_web_clip,
     _source_summary_path,
+    _write_document_aggregate,
     collect_ingest_paths,
     convert_pdf_to_markdown,
     ingest_note,
@@ -899,3 +901,99 @@ def test_convert_pdf_to_markdown_cleanup_removes_stale_source_summaries(vault, c
 
     assert written[0].name == "group-001-001.md"
     assert not (source_dir / "page-001.md").exists()
+
+
+# ── _write_document_aggregate ─────────────────────────────────────────────────
+
+
+def _make_group_source_summary(sources_dir: Path, doc_name: str, group_stem: str, source_file: str) -> Path:
+    """Write a minimal group source summary file as created by _write_pdf_group_source_mirror."""
+    doc_dir = sources_dir / doc_name
+    doc_dir.mkdir(parents=True, exist_ok=True)
+    path = doc_dir / f"{group_stem}.md"
+    content = (
+        f"---\ntitle: {doc_name} - {group_stem}\nsource_file: {source_file}\n"
+        f"quality: medium\ntags:\n- source\n- pdf-group\nstatus: published\n---\n\n"
+        f"# {doc_name} - {group_stem}\n\n## Summary\nA test group summary.\n"
+    )
+    path.write_text(content, encoding="utf-8")
+    return path
+
+
+def test_write_document_aggregate_creates_file(vault, config, db):
+    from obsidian_llm_wiki.models import RawNoteRecord
+
+    sources_dir = vault / "wiki" / "sources"
+    doc_name = "TestDocument"
+    sf1 = "conversions/TestDocument/group-001-004.md"
+    sf2 = "conversions/TestDocument/group-005-008.md"
+
+    _make_group_source_summary(sources_dir, doc_name, "group-001-004", sf1)
+    _make_group_source_summary(sources_dir, doc_name, "group-005-008", sf2)
+
+    db.upsert_raw(RawNoteRecord(path=sf1, content_hash="aaa", status="ingested", summary="Summary one.", quality="high"))
+    db.upsert_raw(RawNoteRecord(path=sf2, content_hash="bbb", status="ingested", summary="Summary two.", quality="medium"))
+    db.upsert_concepts(sf1, ["Process Mining", "Action Flow"])
+    db.upsert_concepts(sf2, ["Process Mining", "Celonis"])
+
+    source_dir = sources_dir / doc_name
+    result = _write_document_aggregate(source_dir, config, db)
+
+    agg_path = sources_dir / f"{doc_name}.md"
+    assert result == agg_path
+    assert agg_path.exists()
+
+    from obsidian_llm_wiki.vault import parse_note
+
+    meta, body = parse_note(agg_path)
+    assert meta["group_count"] == 2
+    assert meta["quality"] == "medium"  # min of high and medium
+    assert "group_sig" in meta
+    assert "## Concepts" in body
+    assert "[[Process Mining]]" in body  # most frequent concept
+    assert "[[Action Flow]]" in body
+    assert "[[Celonis]]" in body
+    assert "## Page Groups" in body
+    assert "group-001-004" in body
+    assert "group-005-008" in body
+
+
+def test_write_document_aggregate_incremental_skip(vault, config, db):
+    from obsidian_llm_wiki.models import RawNoteRecord
+
+    sources_dir = vault / "wiki" / "sources"
+    doc_name = "StableDoc"
+    sf1 = "conversions/StableDoc/group-001-002.md"
+
+    _make_group_source_summary(sources_dir, doc_name, "group-001-002", sf1)
+    db.upsert_raw(RawNoteRecord(path=sf1, content_hash="stable_hash", status="ingested", summary="Stable.", quality="high"))
+
+    source_dir = sources_dir / doc_name
+    agg_path = sources_dir / f"{doc_name}.md"
+
+    first_result = _write_document_aggregate(source_dir, config, db)
+    assert first_result == agg_path
+    assert agg_path.exists()
+
+    mtime_after_first = agg_path.stat().st_mtime
+
+    second_result = _write_document_aggregate(source_dir, config, db)
+    assert second_result is None, "Second call with unchanged state should be skipped"
+    assert agg_path.stat().st_mtime == mtime_after_first
+
+
+def test_find_document_source_dirs_returns_dirs_with_groups(vault, config):
+    sources_dir = vault / "wiki" / "sources"
+
+    # Dir with group files — should be returned
+    (sources_dir / "DocA").mkdir(parents=True)
+    (sources_dir / "DocA" / "group-001-004.md").write_text("x", encoding="utf-8")
+
+    # Dir without group files — should NOT be returned
+    (sources_dir / "OneNote" / "MyNotes").mkdir(parents=True)
+    (sources_dir / "OneNote" / "MyNotes" / "note.md").write_text("x", encoding="utf-8")
+
+    dirs = _find_document_source_dirs(config)
+    dir_names = [d.name for d in dirs]
+    assert "DocA" in dir_names
+    assert "MyNotes" not in dir_names

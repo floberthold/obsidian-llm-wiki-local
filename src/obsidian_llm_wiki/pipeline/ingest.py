@@ -35,6 +35,8 @@ log = logging.getLogger(__name__)
 
 _MAX_SOURCE_PATH_LEN = 220
 
+_QUALITY_RANK: dict[str, int] = {"high": 2, "medium": 1, "low": 0}
+
 _SYSTEM = (
     "You are a knowledge analyst. Read the provided note and extract structured information. "
     "Be concise and accurate. Do not invent information not present in the note. "
@@ -152,8 +154,7 @@ def _merge_chunk_results(results: list[AnalysisResult]) -> AnalysisResult:
                 seen_topics.add(t.lower())
                 all_topics.append(t)
 
-    quality_rank = {"high": 2, "medium": 1, "low": 0}
-    min_result = min(results, key=lambda r: quality_rank.get(r.quality, 1))
+    min_result = min(results, key=lambda r: _QUALITY_RANK.get(r.quality, 1))
 
     merged_language = next((r.language for r in results if r.language), None)
 
@@ -1219,8 +1220,7 @@ def _create_source_summary_page(
     """
     # Derive title from note frontmatter > file stem
     title = src_meta.get("title") or path.stem.replace("-", " ").title()
-    # Mirror the raw folder hierarchy: raw/subdir/note.md -> sources/subdir/note.md
-    out_path = config.sources_dir / path.relative_to(config.raw_dir)
+    out_path = _source_summary_path(config, path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     now = datetime.now().strftime("%Y-%m-%d")
@@ -1323,6 +1323,170 @@ def _ensure_source_summary_for_existing_ingest(
     )
     _create_source_summary_page(path, src_meta, result, config, body=body)
     log.info("Rebuilt missing source summary for already-ingested note: %s", path.name)
+
+
+def _find_document_source_dirs(config: Config) -> list[Path]:
+    """Return wiki/sources/ subdirectories that contain group-*.md files (PDF documents)."""
+    if not config.sources_dir.exists():
+        return []
+    return sorted(d for d in config.sources_dir.rglob("*") if d.is_dir() and any(d.glob("group-*.md")))
+
+
+def _write_document_aggregate(source_dir: Path, config: Config, db: StateDB) -> Path | None:
+    """
+    Write or refresh the document-level aggregation file for a PDF document.
+
+    source_dir is a wiki/sources/<document-name>/ directory.
+    Aggregation file lands at source_dir.parent/<document-name>.md.
+    Returns the path written, or None if already up-to-date.
+    """
+    group_files = sorted(source_dir.glob("group-*.md"))
+    if not group_files:
+        return None
+
+    # Parse each group's source_file reference and look up DB records
+    groups: list[dict] = []
+    for gf in group_files:
+        try:
+            meta, _ = parse_note(gf)
+        except Exception:
+            meta = {}
+        source_file: str = meta.get("source_file", "") if isinstance(meta, dict) else ""
+        record = db.get_raw(source_file) if source_file else None
+        concepts = db.get_concepts_for_sources([source_file]) if source_file else []
+        groups.append(
+            {
+                "file": gf,
+                "meta": meta,
+                "source_file": source_file,
+                "record": record,
+                "concepts": concepts,
+            }
+        )
+
+    # Compute incremental fingerprint from content hashes stored in the DB
+    hash_inputs: list[str] = []
+    for g in groups:
+        r = g["record"]
+        if r and r.content_hash:
+            hash_inputs.append(r.content_hash)
+        else:
+            try:
+                hash_inputs.append(hashlib.sha256(g["file"].read_bytes()).hexdigest()[:16])
+            except OSError:
+                hash_inputs.append(g["source_file"] or g["file"].name)
+
+    current_sig = hashlib.sha256("\n".join(sorted(hash_inputs)).encode()).hexdigest()[:16]
+
+    # Skip regeneration when nothing changed
+    agg_path = source_dir.parent / (source_dir.name + ".md")
+    if agg_path.exists():
+        try:
+            existing_meta, _ = parse_note(agg_path)
+            if existing_meta.get("group_sig") == current_sig:
+                log.debug("Document aggregate up-to-date: %s", source_dir.name)
+                return None
+        except Exception:
+            pass
+
+    # Merge concepts across all groups (most cross-group concepts first, cap 30)
+    concept_counts: dict[str, int] = {}
+    concept_canonical: dict[str, str] = {}
+    for g in groups:
+        for name in g["concepts"]:
+            key = name.lower()
+            concept_counts[key] = concept_counts.get(key, 0) + 1
+            if key not in concept_canonical:
+                concept_canonical[key] = name
+    merged_concepts = [
+        concept_canonical[k] for k in sorted(concept_counts, key=lambda k: -concept_counts[k])
+    ][:30]
+
+    # Best summary: highest-quality group with a non-empty DB summary
+    best_summary = ""
+    best_rank = -1
+    for g in groups:
+        r = g["record"]
+        if r and r.summary and r.summary.strip():
+            rank = _QUALITY_RANK.get(r.quality or "medium", 1)
+            if rank > best_rank:
+                best_rank = rank
+                best_summary = r.summary.strip()
+    if not best_summary:
+        best_summary = f"Aggregated source document with {len(group_files)} group(s)."
+
+    # Overall quality: minimum across recorded qualities (conservative)
+    recorded = [g["record"].quality for g in groups if g["record"] and g["record"].quality in _QUALITY_RANK]
+    overall_quality = min(recorded, key=lambda q: _QUALITY_RANK[q]) if recorded else "medium"
+
+    # Quality breakdown for display
+    q_counts: dict[str, int] = {}
+    for g in groups:
+        r = g["record"]
+        key = r.quality if r and r.quality in _QUALITY_RANK else "failed"
+        q_counts[key] = q_counts.get(key, 0) + 1
+    q_parts = [f"{q_counts[k]} {k}" for k in ("high", "medium", "low", "failed") if q_counts.get(k)]
+    quality_breakdown = " · ".join(q_parts)
+
+    # Detect the source PDF path (raw/<...>/<document-name>.pdf)
+    source_pdf = ""
+    try:
+        rel_to_sources = source_dir.relative_to(config.sources_dir)
+        candidate = config.raw_dir / rel_to_sources.parent / (source_dir.name + ".pdf")
+        if candidate.exists():
+            source_pdf = candidate.relative_to(config.vault).as_posix()
+    except (ValueError, OSError):
+        pass
+
+    # Page group wikilinks using <document-name>/<group-stem> for disambiguation
+    page_group_lines: list[str] = []
+    for g in groups:
+        gf = g["file"]
+        title = g["meta"].get("title", gf.stem) if isinstance(g["meta"], dict) else gf.stem
+        page_group_lines.append(f"- [[{source_dir.name}/{gf.stem}|{title}]]")
+
+    now = datetime.now().strftime("%Y-%m-%d")
+    doc_title = source_dir.name
+
+    out_meta: dict = {
+        "title": doc_title,
+        "aliases": [doc_title.lower()],
+        "tags": ["source", "source-document"],
+        "status": "published",
+        "quality": overall_quality,
+        "group_count": len(group_files),
+        "group_sig": current_sig,
+        "created": now,
+        "updated": now,
+    }
+    if source_pdf:
+        out_meta["source_pdf"] = source_pdf
+
+    concept_lines = "\n".join(f"- [[{name}]]" for name in merged_concepts)
+    page_groups_text = "\n".join(page_group_lines)
+
+    body = "\n".join(
+        [
+            f"# {doc_title}",
+            "",
+            "## Summary",
+            best_summary,
+            "",
+            "## Concepts",
+            concept_lines,
+            "",
+            "## Page Groups",
+            page_groups_text,
+            "",
+            "## Quality Rollup",
+            f"- **Overall quality:** {overall_quality}",
+            f"- **Groups:** {len(group_files)} ({quality_breakdown})",
+        ]
+    )
+
+    write_note(agg_path, out_meta, body)
+    log.info("Document aggregate written: %s", agg_path.name)
+    return agg_path
 
 
 def ingest_note(
@@ -1543,4 +1707,11 @@ def ingest_all(
             force=force,
         )
         results.append((path, result))
+
+    for doc_dir in _find_document_source_dirs(config):
+        try:
+            _write_document_aggregate(doc_dir, config, db)
+        except Exception as e:
+            log.warning("Document aggregate failed for %s: %s", doc_dir.name, e)
+
     return results
