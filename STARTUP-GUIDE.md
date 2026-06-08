@@ -55,6 +55,25 @@ cd my-obsidian-wiki
 set OLLAMA_NUM_PARALLEL=6 && set OLLAMA_NUM_THREADS=6 && olw run
 ```
 
+## Running Open WebUI Locally
+
+From `obsidian-llm-wiki-local`, use the repo-local launcher instead of `open-webui.exe`:
+
+```powershell
+.\scripts\start_openwebui.ps1
+```
+
+This keeps the fix local to this repo and avoids stale Windows entrypoint wrappers after the folder is moved.
+
+Optional parameters:
+
+```powershell
+.\scripts\start_openwebui.ps1 -Port 3001
+.\scripts\start_openwebui.ps1 -OpenAiApiBaseUrl http://127.0.0.1:11434/v1
+```
+
+Open the UI at `http://127.0.0.1:3000`.
+
 
 
 ### Output
