@@ -94,6 +94,24 @@ def _source_summary_dir(config: Config, relative_dir: Path) -> Path:
 
 
 def _source_summary_path(config: Config, path: Path) -> Path:
+    # External source converted files → External/<display-name>/<doc>.md (two levels max)
+    try:
+        rel_from_ext = path.relative_to(config.conversions_dir / "external")
+        slug = rel_from_ext.parts[0]
+        for ext_src in config.external_sources:
+            if _slugify(ext_src.name) == slug:
+                rel_in_source = Path(*rel_from_ext.parts[1:])
+                filename = rel_in_source.name        # "converted.md" or "group-NNN-MMM.md"
+                doc_stem = rel_in_source.parent.name # sanitized original filename stem
+                if filename == "converted.md":
+                    # Single-file conversion: flatten to External/<name>/<stem>.md
+                    return config.sources_dir / "External" / ext_src.name / f"{doc_stem}.md"
+                else:
+                    # PDF group: External/<name>/<pdf-stem>/group-NNN-MMM.md
+                    return config.sources_dir / "External" / ext_src.name / doc_stem / filename
+    except (ValueError, IndexError):
+        pass
+
     try:
         rel_path = path.relative_to(config.raw_dir)
     except ValueError:
