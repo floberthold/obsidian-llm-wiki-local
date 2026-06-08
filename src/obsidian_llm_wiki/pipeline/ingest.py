@@ -852,7 +852,11 @@ def convert_pdf_to_markdown(
     rel_pdf = pdf_path.as_posix()
     extracted_pages: list[tuple[int, str]] = []
     for page_number, page in enumerate(reader.pages, start=1):
-        text = (page.extract_text() or "").strip()
+        try:
+            text = (page.extract_text() or "").strip()
+        except Exception as exc:
+            log.warning("pypdf failed to extract text from %s p%d: %s — skipping page", pdf_path.name, page_number, exc)
+            text = ""
 
         image_descriptions: list[str] = []
         if vision_client and vision_model:
