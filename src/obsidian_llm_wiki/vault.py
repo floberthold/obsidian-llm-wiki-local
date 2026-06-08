@@ -189,7 +189,16 @@ def sanitize_filename(title: str, max_len: int = 100) -> str:
 
 
 def atomic_write(path: Path, content: str, encoding: str = "utf-8") -> None:
-    """Write content to path atomically: write .tmp then rename (crash-safe)."""
+    """Write content to path atomically: write .tmp then rename (crash-safe).
+
+    Normalizes path components first: Windows silently strips trailing spaces
+    from directory names on mkdir/CreateFile, but os.replace() fails when the
+    source (temp file) and destination resolve to different directories because
+    one path string has a trailing space and the other doesn't.
+    """
+    parts = path.parts
+    if any(p != p.strip() for p in parts):
+        path = Path(*[p.strip() for p in parts])
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
     try:
