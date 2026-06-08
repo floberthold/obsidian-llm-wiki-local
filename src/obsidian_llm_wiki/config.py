@@ -80,6 +80,7 @@ def default_wiki_toml(
         f"pdf_max_chunk_chars = 14000\n"
         f"pdf_preserve_page_markers = true\n"
         f"pdf_section_patterns = [\"^#\", \"^chapter\\\\b\", \"^section\\\\b\", \"^part\\\\b\"]\n"
+        f'# vision_model = "llava:7b"  # Ollama vision model for PDF image descriptions; unset = skip\n'
     )
 
 
@@ -130,6 +131,7 @@ class PipelineConfig(BaseModel):
         r"^section\b",
         r"^part\b",
     ]
+    vision_model: str = ""  # Ollama model for PDF image description, e.g. "llava:7b"; empty = skip
 
 
 class RagConfig(BaseModel):

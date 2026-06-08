@@ -6,6 +6,8 @@ Uses the configured fast model (default: qwen3:4b) for analysis.
 
 from __future__ import annotations
 
+import base64
+import csv
 import hashlib
 import logging
 import os
@@ -544,6 +546,16 @@ def _should_rebuild_pdf_groups(pdf_path: Path, output_dir: Path) -> bool:
     return pdf_mtime > newest_group_mtime
 
 
+def _should_rebuild_converted(source_path: Path, out_path: Path) -> bool:
+    """Rebuild the converted markdown when the output is missing or the source is newer."""
+    if not out_path.exists():
+        return True
+    try:
+        return source_path.stat().st_mtime > out_path.stat().st_mtime
+    except OSError:
+        return False
+
+
 def _is_section_boundary(text: str, patterns: list[str]) -> bool:
     first_non_empty = ""
     for line in text.splitlines():
@@ -720,13 +732,40 @@ def convert_pdf_to_markdown(
     section_patterns = pipeline.pdf_section_patterns if pipeline else [r"^#", r"^chapter\\b"]
     preserve_markers = pipeline.pdf_preserve_page_markers if pipeline else True
 
+    vision_model = (config.pipeline.vision_model if config and config.pipeline else "").strip()
+    vision_client = None
+    if vision_model:
+        from ..ollama_client import OllamaClient
+
+        provider_url = config.effective_provider.url if config else "http://localhost:11434"
+        vision_client = OllamaClient(base_url=provider_url)
+
     rel_pdf = pdf_path.as_posix()
     extracted_pages: list[tuple[int, str]] = []
     for page_number, page in enumerate(reader.pages, start=1):
         text = (page.extract_text() or "").strip()
-        if not text:
-            log.debug("Skipping image-only PDF page %d in %s", page_number, pdf_path.name)
+
+        image_descriptions: list[str] = []
+        if vision_client and vision_model:
+            for img in getattr(page, "images", []):
+                try:
+                    b64 = base64.b64encode(img.data).decode("ascii")
+                    desc = vision_client.generate(
+                        prompt="Describe this image concisely in 1-2 sentences for a knowledge base. Focus on content and key information.",
+                        model=vision_model,
+                        images=[b64],
+                    )
+                    if desc.strip():
+                        image_descriptions.append(f"> **Image:** {desc.strip()}")
+                except Exception as exc:
+                    log.debug("Vision LLM failed for image in %s p%d: %s", pdf_path.name, page_number, exc)
+
+        if not text and not image_descriptions:
+            log.debug("Skipping empty page %d in %s", page_number, pdf_path.name)
             continue
+
+        if image_descriptions:
+            text = (text + "\n\n" if text else "") + "\n\n".join(image_descriptions)
 
         extracted_pages.append((page_number, text))
 
@@ -788,6 +827,214 @@ def convert_pdf_to_markdown(
     return written_paths
 
 
+def convert_xlsx_to_markdown(
+    xlsx_path: Path,
+    overwrite: bool = False,
+    config: Config | None = None,
+) -> list[Path]:
+    """Convert an Excel workbook to markdown. Each sheet becomes a ## section with a table."""
+    try:
+        import openpyxl
+    except ImportError:
+        log.warning("openpyxl not installed; skipping %s. Install: uv add openpyxl", xlsx_path.name)
+        return []
+
+    out_dir = xlsx_path.parent / sanitize_filename(xlsx_path.stem)
+    out_path = out_dir / "converted.md"
+    if out_path.exists() and not overwrite and not _should_rebuild_converted(xlsx_path, out_path):
+        return [out_path]
+
+    try:
+        wb = openpyxl.load_workbook(xlsx_path, data_only=True)
+    except Exception as e:
+        log.warning("Failed to read Excel %s: %s", xlsx_path.name, e)
+        return []
+
+    sections: list[str] = []
+    for sheet in wb.worksheets:
+        rows = [r for r in sheet.iter_rows(values_only=True) if any(c is not None for c in r)]
+        if not rows:
+            continue
+        header = [str(c) if c is not None else "" for c in rows[0]]
+        col_count = len(header)
+        lines = [f"## {sheet.title}", "", "| " + " | ".join(header) + " |", "|" + " --- |" * col_count]
+        for row in rows[1:]:
+            cells = [(str(c) if c is not None else "") for c in row]
+            padded = (cells + [""] * col_count)[:col_count]
+            lines.append("| " + " | ".join(padded) + " |")
+        sections.append("\n".join(lines))
+
+    if not sections:
+        return []
+
+    body = "\n\n".join(sections) + "\n"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    write_note(
+        out_path,
+        {"title": xlsx_path.stem, "source_xlsx": xlsx_path.as_posix(), "tags": ["xlsx-converted"]},
+        body,
+    )
+    log.info("Converted Excel %s → %s (%d sheet(s))", xlsx_path.name, out_path.name, len(sections))
+    return [out_path]
+
+
+def convert_docx_to_markdown(
+    docx_path: Path,
+    overwrite: bool = False,
+    config: Config | None = None,
+) -> list[Path]:
+    """Convert a Word document to markdown, preserving heading hierarchy and tables."""
+    try:
+        from docx import Document
+    except ImportError:
+        log.warning("python-docx not installed; skipping %s. Install: uv add python-docx", docx_path.name)
+        return []
+
+    out_dir = docx_path.parent / sanitize_filename(docx_path.stem)
+    out_path = out_dir / "converted.md"
+    if out_path.exists() and not overwrite and not _should_rebuild_converted(docx_path, out_path):
+        return [out_path]
+
+    try:
+        doc = Document(str(docx_path))
+    except Exception as e:
+        log.warning("Failed to read Word doc %s: %s", docx_path.name, e)
+        return []
+
+    _HEADING_PREFIXES = {f"heading {i}": "#" * i for i in range(1, 5)}
+    lines: list[str] = []
+
+    for para in doc.paragraphs:
+        text = para.text.strip()
+        if not text:
+            continue
+        style_name = (para.style.name or "").lower() if para.style else ""
+        prefix = _HEADING_PREFIXES.get(style_name, "")
+        lines.append(f"{prefix} {text}" if prefix else text)
+
+    for i, table in enumerate(doc.tables):
+        rows = [[c.text.strip().replace("\n", " ") for c in row.cells] for row in table.rows]
+        if not rows:
+            continue
+        col_count = len(rows[0])
+        lines.append(f"\n## Table {i + 1}\n")
+        lines.append("| " + " | ".join(rows[0]) + " |")
+        lines.append("|" + " --- |" * col_count)
+        for row in rows[1:]:
+            padded = (row + [""] * col_count)[:col_count]
+            lines.append("| " + " | ".join(padded) + " |")
+
+    if not lines:
+        return []
+
+    body = "\n".join(lines) + "\n"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    write_note(
+        out_path,
+        {"title": docx_path.stem, "source_docx": docx_path.as_posix(), "tags": ["docx-converted"]},
+        body,
+    )
+    log.info("Converted Word doc %s → %s", docx_path.name, out_path.name)
+    return [out_path]
+
+
+def convert_pptx_to_markdown(
+    pptx_path: Path,
+    overwrite: bool = False,
+    config: Config | None = None,
+) -> list[Path]:
+    """Convert a PowerPoint presentation to markdown. Each slide becomes a ## section."""
+    try:
+        from pptx import Presentation
+    except ImportError:
+        log.warning("python-pptx not installed; skipping %s. Install: uv add python-pptx", pptx_path.name)
+        return []
+
+    out_dir = pptx_path.parent / sanitize_filename(pptx_path.stem)
+    out_path = out_dir / "converted.md"
+    if out_path.exists() and not overwrite and not _should_rebuild_converted(pptx_path, out_path):
+        return [out_path]
+
+    try:
+        prs = Presentation(str(pptx_path))
+    except Exception as e:
+        log.warning("Failed to read PowerPoint %s: %s", pptx_path.name, e)
+        return []
+
+    sections: list[str] = []
+    for slide_num, slide in enumerate(prs.slides, start=1):
+        title_shape = slide.shapes.title
+        title_text = (title_shape.text or "").strip() if title_shape else ""
+        heading = f"## Slide {slide_num}: {title_text}" if title_text else f"## Slide {slide_num}"
+
+        body_lines: list[str] = []
+        for shape in slide.shapes:
+            if not shape.has_text_frame:
+                continue
+            if shape is title_shape:
+                continue
+            text = shape.text_frame.text.strip()
+            if text:
+                body_lines.append(text)
+
+        parts = [heading]
+        if body_lines:
+            parts.append("\n".join(body_lines))
+        sections.append("\n\n".join(parts))
+
+    if not sections:
+        return []
+
+    body = "\n\n".join(sections) + "\n"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    write_note(
+        out_path,
+        {"title": pptx_path.stem, "source_pptx": pptx_path.as_posix(), "tags": ["pptx-converted"]},
+        body,
+    )
+    log.info("Converted PowerPoint %s → %s (%d slide(s))", pptx_path.name, out_path.name, len(sections))
+    return [out_path]
+
+
+def convert_csv_to_markdown(
+    csv_path: Path,
+    overwrite: bool = False,
+    config: Config | None = None,
+) -> list[Path]:
+    """Convert a CSV file to a markdown table."""
+    out_dir = csv_path.parent / sanitize_filename(csv_path.stem)
+    out_path = out_dir / "converted.md"
+    if out_path.exists() and not overwrite and not _should_rebuild_converted(csv_path, out_path):
+        return [out_path]
+
+    try:
+        with open(csv_path, newline="", encoding="utf-8", errors="replace") as f:
+            rows = [r for r in csv.reader(f) if any(c.strip() for c in r)]
+    except Exception as e:
+        log.warning("Failed to read CSV %s: %s", csv_path.name, e)
+        return []
+
+    if not rows:
+        return []
+
+    col_count = max(len(r) for r in rows)
+    header = (rows[0] + [""] * col_count)[:col_count]
+    lines = ["| " + " | ".join(header) + " |", "|" + " --- |" * col_count]
+    for row in rows[1:]:
+        padded = (row + [""] * col_count)[:col_count]
+        lines.append("| " + " | ".join(c.replace("\n", " ") for c in padded) + " |")
+
+    body = "\n".join(lines) + "\n"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    write_note(
+        out_path,
+        {"title": csv_path.stem, "source_csv": csv_path.as_posix(), "tags": ["csv-converted"]},
+        body,
+    )
+    log.info("Converted CSV %s → %s", csv_path.name, out_path.name)
+    return [out_path]
+
+
 def collect_ingest_paths(config: Config, paths: list[Path] | None = None) -> list[Path]:
     """Collect markdown paths for ingest, auto-converting PDFs into grouped notes, and allowing arbitrary .md files as first-class input.
 
@@ -815,6 +1062,38 @@ def collect_ingest_paths(config: Config, paths: list[Path] | None = None) -> lis
                 if key not in seen:
                     seen.add(key)
                     md_paths.append(page_path)
+        elif suffix == ".xlsx":
+            out_path = path.parent / sanitize_filename(path.stem) / "converted.md"
+            overwrite = _should_rebuild_converted(path, out_path)
+            for converted in convert_xlsx_to_markdown(path, overwrite=overwrite, config=config):
+                key = converted.resolve().as_posix()
+                if key not in seen:
+                    seen.add(key)
+                    md_paths.append(converted)
+        elif suffix == ".docx":
+            out_path = path.parent / sanitize_filename(path.stem) / "converted.md"
+            overwrite = _should_rebuild_converted(path, out_path)
+            for converted in convert_docx_to_markdown(path, overwrite=overwrite, config=config):
+                key = converted.resolve().as_posix()
+                if key not in seen:
+                    seen.add(key)
+                    md_paths.append(converted)
+        elif suffix == ".pptx":
+            out_path = path.parent / sanitize_filename(path.stem) / "converted.md"
+            overwrite = _should_rebuild_converted(path, out_path)
+            for converted in convert_pptx_to_markdown(path, overwrite=overwrite, config=config):
+                key = converted.resolve().as_posix()
+                if key not in seen:
+                    seen.add(key)
+                    md_paths.append(converted)
+        elif suffix == ".csv":
+            out_path = path.parent / sanitize_filename(path.stem) / "converted.md"
+            overwrite = _should_rebuild_converted(path, out_path)
+            for converted in convert_csv_to_markdown(path, overwrite=overwrite, config=config):
+                key = converted.resolve().as_posix()
+                if key not in seen:
+                    seen.add(key)
+                    md_paths.append(converted)
         elif suffix == ".md":
             page_number = _extract_page_number(path)
             if page_number is not None:

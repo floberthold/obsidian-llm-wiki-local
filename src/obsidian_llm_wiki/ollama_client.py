@@ -98,6 +98,7 @@ class OllamaClient:
         format: str | None = None,
         num_ctx: int = 8192,
         num_predict: int = -1,
+        images: list[str] | None = None,
         telemetry_config=None,
         telemetry_stage: str = "",
     ) -> str:
@@ -111,6 +112,8 @@ class OllamaClient:
         }
         if format:
             payload["format"] = format
+        if images:
+            payload["images"] = images  # base64-encoded strings; enables multimodal (vision) models
 
         t0 = time.monotonic()
         try:
