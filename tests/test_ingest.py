@@ -16,7 +16,7 @@ from obsidian_llm_wiki.pipeline.ingest import (
     _SYSTEM,
     _analyze_body,
     _build_analysis_prompt,
-    _page_output_dir,
+    _conversion_output_dir,
     _merge_chunk_results,
     _normalize_concepts,
     _preprocess_web_clip,
@@ -33,6 +33,7 @@ from obsidian_llm_wiki.state import StateDB
 @pytest.fixture
 def vault(tmp_path):
     (tmp_path / "raw").mkdir()
+    (tmp_path / "conversions").mkdir()
     (tmp_path / "wiki").mkdir()
     (tmp_path / "wiki" / ".drafts").mkdir()
     (tmp_path / "wiki" / "sources").mkdir()
@@ -747,7 +748,7 @@ def test_convert_pdf_to_markdown_creates_grouped_files(vault, config, monkeypatc
     written = convert_pdf_to_markdown(pdf_path, overwrite=True, config=config)
 
     assert [p.name for p in written] == ["group-001-002.md"]
-    assert all(p.parent == _page_output_dir(pdf_path) for p in written)
+    assert all(p.parent == _conversion_output_dir(pdf_path, config) for p in written)
     assert "## Pages 1-2" in written[0].read_text(encoding="utf-8")
     assert "[Page 1]" in written[0].read_text(encoding="utf-8")
     assert "[Page 2]" in written[0].read_text(encoding="utf-8")
@@ -801,13 +802,13 @@ def test_collect_ingest_paths_explicit_pdf_returns_group_files(vault, config, mo
     collected = collect_ingest_paths(config, [pdf_path])
 
     assert len(collected) == 1
-    assert collected[0] == _page_output_dir(pdf_path) / "group-001-001.md"
+    assert collected[0] == _conversion_output_dir(pdf_path, config) / "group-001-001.md"
 
 
 def test_collect_ingest_paths_pdf_reuses_existing_groups_without_overwrite(vault, config, monkeypatch):
     pdf_path = vault / "raw" / "Deck.pdf"
     pdf_path.write_bytes(b"%PDF-1.4")
-    out_dir = _page_output_dir(pdf_path)
+    out_dir = _conversion_output_dir(pdf_path, config)
     out_dir.mkdir(parents=True, exist_ok=True)
     existing_group = out_dir / "group-001-001.md"
     existing_group.write_text("---\ntitle: Existing\n---\n\ncontent", encoding="utf-8")
@@ -845,7 +846,7 @@ def test_collect_ingest_paths_migrates_pagewise_markdown_to_grouped(vault, confi
 def test_convert_pdf_to_markdown_cleanup_removes_legacy_page_files(vault, config, monkeypatch):
     pdf_path = vault / "raw" / "Deck.pdf"
     pdf_path.write_bytes(b"%PDF-1.4")
-    out_dir = _page_output_dir(pdf_path)
+    out_dir = _conversion_output_dir(pdf_path, config)
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "page-001.md").write_text("legacy", encoding="utf-8")
 
@@ -873,7 +874,7 @@ def test_convert_pdf_to_markdown_cleanup_removes_stale_source_summaries(vault, c
     pdf_path.parent.mkdir(parents=True, exist_ok=True)
     pdf_path.write_bytes(b"%PDF-1.4")
 
-    raw_out_dir = _page_output_dir(pdf_path)
+    raw_out_dir = _conversion_output_dir(pdf_path, config)
     raw_out_dir.mkdir(parents=True, exist_ok=True)
     (raw_out_dir / "page-001.md").write_text("legacy raw", encoding="utf-8")
 

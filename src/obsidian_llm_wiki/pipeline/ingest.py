@@ -61,7 +61,10 @@ def _source_summary_dir(config: Config, relative_dir: Path) -> Path:
 
 
 def _source_summary_path(config: Config, path: Path) -> Path:
-    rel_path = path.relative_to(config.raw_dir)
+    try:
+        rel_path = path.relative_to(config.raw_dir)
+    except ValueError:
+        rel_path = path.relative_to(config.conversions_dir)
     exact_path = config.sources_dir / rel_path
     if len(str(exact_path)) <= _MAX_SOURCE_PATH_LEN:
         return exact_path
@@ -441,19 +444,30 @@ def _is_ingest_candidate(path: Path) -> bool:
     return path.is_file() and "processed" not in path.parts and not path.name.startswith(".")
 
 
-def _page_output_dir(pdf_path: Path) -> Path:
-    return pdf_path.parent / sanitize_filename(pdf_path.stem)
+def _conversion_output_dir(source_path: Path, config: Config | None) -> Path:
+    """Return the directory under conversions/ that mirrors the source file's location in raw/."""
+    if config is not None:
+        try:
+            rel = source_path.relative_to(config.raw_dir)
+        except ValueError:
+            rel = Path(source_path.stem)
+        return config.conversions_dir / rel.parent / sanitize_filename(source_path.stem)
+    # fallback when no config available (e.g. tests calling converters directly)
+    return source_path.parent / sanitize_filename(source_path.stem)
 
 
 def _cleanup_source_summary_mirror(
     output_dir: Path,
     config: Config,
 ) -> None:
-    """Remove stale mirrored source summaries for a reconverted PDF folder."""
+    """Remove stale mirrored source summaries for a reconverted conversion folder."""
     try:
         rel_output = output_dir.relative_to(config.raw_dir)
     except ValueError:
-        return
+        try:
+            rel_output = output_dir.relative_to(config.conversions_dir)
+        except ValueError:
+            return
 
     source_dir = _source_summary_dir(config, rel_output)
     if not source_dir.exists():
@@ -704,7 +718,7 @@ def convert_pdf_to_markdown(
         log.warning("PDF conversion unavailable for %s: %s", pdf_path.name, e)
         return []
 
-    output_dir = _page_output_dir(pdf_path)
+    output_dir = _conversion_output_dir(pdf_path, config)
     existing_groups = sorted(output_dir.glob("group-*.md")) if output_dir.exists() else []
     if existing_groups and not overwrite:
         return existing_groups
@@ -839,7 +853,7 @@ def convert_xlsx_to_markdown(
         log.warning("openpyxl not installed; skipping %s. Install: uv add openpyxl", xlsx_path.name)
         return []
 
-    out_dir = xlsx_path.parent / sanitize_filename(xlsx_path.stem)
+    out_dir = _conversion_output_dir(xlsx_path, config)
     out_path = out_dir / "converted.md"
     if out_path.exists() and not overwrite and not _should_rebuild_converted(xlsx_path, out_path):
         return [out_path]
@@ -890,7 +904,7 @@ def convert_docx_to_markdown(
         log.warning("python-docx not installed; skipping %s. Install: uv add python-docx", docx_path.name)
         return []
 
-    out_dir = docx_path.parent / sanitize_filename(docx_path.stem)
+    out_dir = _conversion_output_dir(docx_path, config)
     out_path = out_dir / "converted.md"
     if out_path.exists() and not overwrite and not _should_rebuild_converted(docx_path, out_path):
         return [out_path]
@@ -950,7 +964,7 @@ def convert_pptx_to_markdown(
         log.warning("python-pptx not installed; skipping %s. Install: uv add python-pptx", pptx_path.name)
         return []
 
-    out_dir = pptx_path.parent / sanitize_filename(pptx_path.stem)
+    out_dir = _conversion_output_dir(pptx_path, config)
     out_path = out_dir / "converted.md"
     if out_path.exists() and not overwrite and not _should_rebuild_converted(pptx_path, out_path):
         return [out_path]
@@ -1002,7 +1016,7 @@ def convert_csv_to_markdown(
     config: Config | None = None,
 ) -> list[Path]:
     """Convert a CSV file to a markdown table."""
-    out_dir = csv_path.parent / sanitize_filename(csv_path.stem)
+    out_dir = _conversion_output_dir(csv_path, config)
     out_path = out_dir / "converted.md"
     if out_path.exists() and not overwrite and not _should_rebuild_converted(csv_path, out_path):
         return [out_path]
@@ -1035,12 +1049,45 @@ def convert_csv_to_markdown(
     return [out_path]
 
 
+def _cleanup_legacy_raw_conversion_dirs(config: Config) -> None:
+    """Remove old conversion subdirectories that were created inside raw/ before the conversions/ bucket existed.
+
+    Looks for directories inside raw/ whose name matches a source file stem and contains only
+    group-*.md or converted.md files — the signatures of old-style in-place conversions.
+    """
+    if not config.raw_dir.exists():
+        return
+    source_extensions = {".pdf", ".xlsx", ".docx", ".pptx", ".csv"}
+    for source_file in config.raw_dir.rglob("*"):
+        if source_file.suffix.lower() not in source_extensions:
+            continue
+        legacy_dir = source_file.parent / sanitize_filename(source_file.stem)
+        if not legacy_dir.is_dir():
+            continue
+        contents = list(legacy_dir.iterdir())
+        if not contents:
+            continue
+        is_conversion_dir = all(
+            f.is_file() and (f.name == "converted.md" or f.name.startswith("group-") or f.name.startswith("page-"))
+            for f in contents
+        )
+        if is_conversion_dir:
+            for f in contents:
+                f.unlink(missing_ok=True)
+            try:
+                legacy_dir.rmdir()
+                log.info("Removed legacy raw/ conversion dir: %s", legacy_dir.relative_to(config.vault))
+            except OSError:
+                pass
+
+
 def collect_ingest_paths(config: Config, paths: list[Path] | None = None) -> list[Path]:
     """Collect markdown paths for ingest, auto-converting PDFs into grouped notes, and allowing arbitrary .md files as first-class input.
 
     All .md files (not just grouped PDF markdown) are included for chunking, analysis, and summary/concept extraction.
     """
     if paths is None:
+        _cleanup_legacy_raw_conversion_dirs(config)
         candidates = list(config.raw_dir.rglob("*")) if config.raw_dir.exists() else []
     else:
         candidates = [Path(path) for path in paths]
@@ -1055,7 +1102,7 @@ def collect_ingest_paths(config: Config, paths: list[Path] | None = None) -> lis
 
         suffix = path.suffix.lower()
         if suffix == ".pdf":
-            output_dir = _page_output_dir(path)
+            output_dir = _conversion_output_dir(path, config)
             overwrite = _should_rebuild_pdf_groups(path, output_dir)
             for page_path in convert_pdf_to_markdown(path, overwrite=overwrite, config=config):
                 key = page_path.resolve().as_posix()
@@ -1063,7 +1110,7 @@ def collect_ingest_paths(config: Config, paths: list[Path] | None = None) -> lis
                     seen.add(key)
                     md_paths.append(page_path)
         elif suffix == ".xlsx":
-            out_path = path.parent / sanitize_filename(path.stem) / "converted.md"
+            out_path = _conversion_output_dir(path, config) / "converted.md"
             overwrite = _should_rebuild_converted(path, out_path)
             for converted in convert_xlsx_to_markdown(path, overwrite=overwrite, config=config):
                 key = converted.resolve().as_posix()
@@ -1071,7 +1118,7 @@ def collect_ingest_paths(config: Config, paths: list[Path] | None = None) -> lis
                     seen.add(key)
                     md_paths.append(converted)
         elif suffix == ".docx":
-            out_path = path.parent / sanitize_filename(path.stem) / "converted.md"
+            out_path = _conversion_output_dir(path, config) / "converted.md"
             overwrite = _should_rebuild_converted(path, out_path)
             for converted in convert_docx_to_markdown(path, overwrite=overwrite, config=config):
                 key = converted.resolve().as_posix()
@@ -1079,7 +1126,7 @@ def collect_ingest_paths(config: Config, paths: list[Path] | None = None) -> lis
                     seen.add(key)
                     md_paths.append(converted)
         elif suffix == ".pptx":
-            out_path = path.parent / sanitize_filename(path.stem) / "converted.md"
+            out_path = _conversion_output_dir(path, config) / "converted.md"
             overwrite = _should_rebuild_converted(path, out_path)
             for converted in convert_pptx_to_markdown(path, overwrite=overwrite, config=config):
                 key = converted.resolve().as_posix()
@@ -1087,7 +1134,7 @@ def collect_ingest_paths(config: Config, paths: list[Path] | None = None) -> lis
                     seen.add(key)
                     md_paths.append(converted)
         elif suffix == ".csv":
-            out_path = path.parent / sanitize_filename(path.stem) / "converted.md"
+            out_path = _conversion_output_dir(path, config) / "converted.md"
             overwrite = _should_rebuild_converted(path, out_path)
             for converted in convert_csv_to_markdown(path, overwrite=overwrite, config=config):
                 key = converted.resolve().as_posix()

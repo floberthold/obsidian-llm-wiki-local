@@ -171,6 +171,10 @@ class Config(BaseModel):
         return self.vault / "raw"
 
     @property
+    def conversions_dir(self) -> Path:
+        return self.vault / "conversions"
+
+    @property
     def wiki_dir(self) -> Path:
         return self.vault / "wiki"
 

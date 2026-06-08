@@ -23,6 +23,7 @@ from obsidian_llm_wiki.state import StateDB
 @pytest.fixture
 def vault(tmp_path: Path) -> Path:
     (tmp_path / "raw").mkdir()
+    (tmp_path / "conversions").mkdir()
     (tmp_path / "wiki").mkdir()
     (tmp_path / "wiki" / ".drafts").mkdir()
     (tmp_path / ".olw").mkdir()
@@ -464,7 +465,7 @@ def test_orchestrator_dry_run_converts_pdf_into_page_markdown(config, db, monkey
     report = orch.run(paths=[str(pdf_path)], dry_run=True)
 
     assert report.ingested == 1
-    assert (config.vault / "raw" / "Slides" / "group-001-002.md").exists()
+    assert (config.vault / "conversions" / "Slides" / "group-001-002.md").exists()
 
 
 def test_orchestrator_generates_bundles_by_default(config, db):
