@@ -166,13 +166,14 @@ class LintResult(BaseModel):
 class RawNoteRecord(BaseModel):
     path: str
     content_hash: str
-    status: Literal["new", "ingested", "compiled", "failed"] = "new"
+    status: Literal["new", "ingested", "compiled", "failed", "duplicate"] = "new"
     summary: str | None = None
     quality: str | None = None
     language: str | None = None
     ingested_at: datetime | None = None
     compiled_at: datetime | None = None
     error: str | None = None
+    canonical_path: str | None = None
 
 
 class WikiArticleRecord(BaseModel):

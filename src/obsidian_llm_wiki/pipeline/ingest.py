@@ -490,12 +490,23 @@ def _is_ingest_candidate(path: Path) -> bool:
     return path.is_file() and "processed" not in path.parts and not path.name.startswith(".")
 
 
+def _sanitize_path_parts(p: Path) -> Path:
+    """Strip leading/trailing whitespace from each component of a relative path.
+
+    SharePoint-synced folders sometimes have trailing spaces in their names.
+    Windows silently strips them on mkdir() but then fails os.replace() because
+    the path string no longer resolves to the actual directory.
+    """
+    clean = [part.strip() for part in p.parts]
+    return Path(*clean) if clean else Path(".")
+
+
 def _conversion_output_dir(source_path: Path, config: Config | None) -> Path:
     """Return the directory under conversions/ that mirrors the source file's location."""
     if config is not None:
         try:
             rel = source_path.relative_to(config.raw_dir)
-            return config.conversions_dir / rel.parent / sanitize_filename(source_path.stem)
+            return config.conversions_dir / _sanitize_path_parts(rel.parent) / sanitize_filename(source_path.stem)
         except ValueError:
             pass
         for ext_src in config.external_sources:
@@ -506,7 +517,7 @@ def _conversion_output_dir(source_path: Path, config: Config | None) -> Path:
                     config.conversions_dir
                     / "external"
                     / slug
-                    / rel.parent
+                    / _sanitize_path_parts(rel.parent)
                     / sanitize_filename(source_path.stem)
                 )
             except ValueError:
@@ -1627,6 +1638,30 @@ def _write_document_aggregate(source_dir: Path, config: Config, db: StateDB) -> 
     return agg_path
 
 
+def _create_duplicate_source_summary(
+    path: Path,
+    src_meta: dict,
+    canonical: "RawNoteRecord",
+    concepts: list[str],
+    config: Config,
+    ext_src: "ExternalSourceConfig | None",
+) -> None:
+    """Write a source summary page for a duplicate path, reusing the canonical's analysis data."""
+    concept_objects = [Concept(name=name, aliases=[]) for name in concepts[:8]]
+    quality = canonical.quality if canonical.quality in {"low", "medium", "high"} else "medium"
+    result = AnalysisResult(
+        summary=(canonical.summary or "").strip() or "Duplicate of another source.",
+        concepts=concept_objects,
+        suggested_topics=[],
+        quality=quality,
+        language=canonical.language,
+    )
+    try:
+        _create_source_summary_page(path, src_meta, result, config, ext_src=ext_src)
+    except Exception as e:
+        log.warning("Source summary page failed for duplicate %s: %s", path.name, e)
+
+
 def ingest_note(
     path: Path,
     config: Config,
@@ -1660,12 +1695,23 @@ def ingest_note(
     hash_input = (source_pdf + "\x00" + body_for_hash) if source_pdf else body_for_hash
     h = _content_hash(hash_input)
 
-    # Dedup check
     rel_path = path.relative_to(config.vault).as_posix()
 
+    # Fast-path: already registered as a duplicate with the same hash — nothing to do.
+    record = db.get_raw(rel_path)
+    if record and record.status == "duplicate" and record.content_hash == h:
+        log.info("Already registered duplicate: %s", path.name)
+        return None
+
+    # Dedup check against the canonical record for this content hash.
     existing = db.get_raw_by_hash(h)
     if existing and existing.path != rel_path:
-        log.info("Duplicate of %s, skipping %s", existing.path, path.name)
+        log.info("Duplicate of %s, registering %s", existing.path, path.name)
+        db.register_duplicate(rel_path, existing.path, h)
+        canonical_concepts = db.get_concepts_for_sources([existing.path])
+        if canonical_concepts:
+            db.upsert_concepts(rel_path, canonical_concepts)
+        _create_duplicate_source_summary(path, meta, existing, canonical_concepts, config, ext_src)
         emit_event(
             config,
             event_type="function_timing",
@@ -1673,13 +1719,11 @@ def ingest_note(
             stage="ingest",
             model=config.models.fast,
             success=True,
-            outcome="skipped_duplicate",
+            outcome="registered_duplicate",
             duration_ms=round((time.monotonic() - fn_t0) * 1000.0, 2),
             note=path.name,
         )
         return None
-
-    record = db.get_raw(rel_path)
 
     if record and record.status == "ingested" and not force:
         if record.content_hash == h:

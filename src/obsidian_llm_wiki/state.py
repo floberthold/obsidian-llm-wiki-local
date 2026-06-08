@@ -22,7 +22,7 @@ from pathlib import Path
 
 from .models import RawNoteRecord, WikiArticleRecord
 
-_CURRENT_SCHEMA_VERSION = 5
+_CURRENT_SCHEMA_VERSION = 6
 
 # Full current schema — idempotent (CREATE IF NOT EXISTS).
 # Fresh DBs get all tables + columns from here. Existing DBs use _VERSIONED_MIGRATIONS.
@@ -33,15 +33,16 @@ CREATE TABLE IF NOT EXISTS schema_version (
 );
 
 CREATE TABLE IF NOT EXISTS raw_notes (
-    path        TEXT PRIMARY KEY,
-    content_hash TEXT NOT NULL,
-    status      TEXT NOT NULL DEFAULT 'new',
-    summary     TEXT,
-    quality     TEXT,
-    language    TEXT,
-    ingested_at TEXT,
-    compiled_at TEXT,
-    error       TEXT
+    path           TEXT PRIMARY KEY,
+    content_hash   TEXT NOT NULL,
+    status         TEXT NOT NULL DEFAULT 'new',
+    summary        TEXT,
+    quality        TEXT,
+    language       TEXT,
+    ingested_at    TEXT,
+    compiled_at    TEXT,
+    error          TEXT,
+    canonical_path TEXT
 );
 
 CREATE TABLE IF NOT EXISTS concepts (
@@ -233,6 +234,10 @@ _VERSIONED_MIGRATIONS: dict[int, list[str]] = {
         "CREATE INDEX IF NOT EXISTS idx_doc_metrics_path ON doc_metrics(doc_path)",
         "CREATE INDEX IF NOT EXISTS idx_pipeline_runs_started ON pipeline_runs(started_at)",
     ],
+    6: [
+        "ALTER TABLE raw_notes ADD COLUMN canonical_path TEXT",
+        "CREATE INDEX IF NOT EXISTS idx_raw_canonical ON raw_notes(canonical_path)",
+    ],
 }
 
 
@@ -403,9 +408,30 @@ class StateDB:
 
     def get_raw_by_hash(self, content_hash: str) -> RawNoteRecord | None:
         row = self._conn.execute(
-            "SELECT * FROM raw_notes WHERE content_hash = ?", (content_hash,)
+            "SELECT * FROM raw_notes WHERE content_hash = ? AND canonical_path IS NULL",
+            (content_hash,),
         ).fetchone()
         return _row_to_raw(row) if row else None
+
+    def register_duplicate(self, path: str, canonical_path: str, content_hash: str) -> None:
+        now = datetime.now().isoformat(timespec="seconds")
+        with self._tx():
+            self._conn.execute(
+                """INSERT INTO raw_notes (path, content_hash, status, canonical_path, ingested_at)
+                   VALUES (?, ?, 'duplicate', ?, ?)
+                   ON CONFLICT(path) DO UPDATE SET
+                     content_hash    = excluded.content_hash,
+                     canonical_path  = excluded.canonical_path,
+                     status          = 'duplicate',
+                     ingested_at     = excluded.ingested_at""",
+                (path, content_hash, canonical_path, now),
+            )
+
+    def get_duplicates_for_canonical(self, canonical_path: str) -> list[str]:
+        rows = self._conn.execute(
+            "SELECT path FROM raw_notes WHERE canonical_path = ?", (canonical_path,)
+        ).fetchall()
+        return [r[0] for r in rows]
 
     def list_raw(self, status: str | None = None) -> list[RawNoteRecord]:
         if status:
@@ -765,6 +791,7 @@ def _row_to_raw(row: sqlite3.Row) -> RawNoteRecord:
         ingested_at=datetime.fromisoformat(row["ingested_at"]) if row["ingested_at"] else None,
         compiled_at=datetime.fromisoformat(row["compiled_at"]) if row["compiled_at"] else None,
         error=row["error"],
+        canonical_path=row["canonical_path"] if "canonical_path" in keys else None,
     )
 
 
