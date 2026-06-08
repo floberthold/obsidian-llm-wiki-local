@@ -16,7 +16,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from ..config import Config
+from ..config import Config, ExternalSourceConfig
 from ..models import AnalysisResult, Concept, RawNoteRecord
 from ..protocols import LLMClientProtocol
 from ..state import StateDB
@@ -37,6 +37,36 @@ log = logging.getLogger(__name__)
 _MAX_SOURCE_PATH_LEN = 220
 
 _QUALITY_RANK: dict[str, int] = {"high": 2, "medium": 1, "low": 0}
+
+
+def _slugify(name: str) -> str:
+    """Convert a display name to a filesystem-safe slug, e.g. 'Delivery Team' → 'delivery-team'."""
+    slug = re.sub(r"[^\w\s-]", "", name.lower())
+    return re.sub(r"[\s_]+", "-", slug).strip("-")
+
+
+def _find_external_source_for_path(path: Path, config: Config) -> ExternalSourceConfig | None:
+    """Return the ExternalSourceConfig associated with a path, or None.
+
+    Handles both original source paths (under ext_src.path) and converted output
+    paths (under vault/conversions/external/<slug>/).
+    """
+    for ext_src in config.external_sources:
+        try:
+            path.relative_to(ext_src.path)
+            return ext_src
+        except ValueError:
+            continue
+    try:
+        rel = path.relative_to(config.conversions_dir / "external")
+        slug = rel.parts[0]
+        for ext_src in config.external_sources:
+            if _slugify(ext_src.name) == slug:
+                return ext_src
+    except (ValueError, IndexError):
+        pass
+    return None
+
 
 _SYSTEM = (
     "You are a knowledge analyst. Read the provided note and extract structured information. "
@@ -97,10 +127,11 @@ def _build_analysis_prompt(
     existing_concepts: list[str],
     path_name: str = "",
     chunk_label: str = "",
+    extract_attribution: bool = False,
 ) -> str:
     concepts_hint = ", ".join(existing_concepts[:30]) if existing_concepts else "none yet"
     label = f" {chunk_label}" if chunk_label else ""
-    return (
+    prompt = (
         f"Analyze this note{label} and extract structured metadata.\n\n"
         f"Existing wiki concepts (reuse these names where applicable): {concepts_hint}\n\n"
         f"For each concept, provide 3-5 short surface forms used in running text "
@@ -113,6 +144,14 @@ def _build_analysis_prompt(
         f"- Generic navigation entries such as 'index' or 'table of contents'\n\n"
         f"NOTE CONTENT:\n{body}"
     )
+    if extract_attribution:
+        prompt += (
+            "\n\nADDITIONAL: If the document is clearly and explicitly associated with a "
+            "specific client organization or named project, return their names in 'client' "
+            "and 'project'. If not clearly stated in the document, return null for both — "
+            "do not guess or infer."
+        )
+    return prompt
 
 
 def _merge_chunk_results(results: list[AnalysisResult]) -> AnalysisResult:
@@ -158,6 +197,8 @@ def _merge_chunk_results(results: list[AnalysisResult]) -> AnalysisResult:
     min_result = min(results, key=lambda r: _QUALITY_RANK.get(r.quality, 1))
 
     merged_language = next((r.language for r in results if r.language), None)
+    merged_client = next((r.client for r in results if r.client), None)
+    merged_project = next((r.project for r in results if r.project), None)
 
     return AnalysisResult(
         summary=results[0].summary,
@@ -165,6 +206,8 @@ def _merge_chunk_results(results: list[AnalysisResult]) -> AnalysisResult:
         suggested_topics=all_topics[:5],
         quality=min_result.quality,
         language=merged_language,
+        client=merged_client,
+        project=merged_project,
     )
 
 
@@ -174,13 +217,14 @@ def _analyze_body(
     path_name: str,
     client: LLMClientProtocol,
     config: Config,
+    extract_attribution: bool = False,
 ) -> AnalysisResult:
     """Analyze note body, splitting into chunks when body exceeds configured chunk size."""
     ratio = max(0.25, min(config.pipeline.ingest_chunk_ratio, 0.9))
     chunk_size = max(1, int(config.effective_provider.fast_ctx * ratio))
 
     if len(body) <= chunk_size:
-        prompt = _build_analysis_prompt(body, existing_concepts, path_name)
+        prompt = _build_analysis_prompt(body, existing_concepts, path_name, extract_attribution=extract_attribution)
         return request_structured(
             client=client,
             prompt=prompt,
@@ -207,7 +251,7 @@ def _analyze_body(
         label = f"[part {idx + 1}/{len(chunks)}]"
         log.info("Analyzing %s %s …", path_name or "note", label)
         t0 = time.monotonic()
-        prompt = _build_analysis_prompt(chunk, existing_concepts, path_name, chunk_label=label)
+        prompt = _build_analysis_prompt(chunk, existing_concepts, path_name, chunk_label=label, extract_attribution=extract_attribution)
         result = request_structured(
             client=client,
             prompt=prompt,
@@ -447,13 +491,27 @@ def _is_ingest_candidate(path: Path) -> bool:
 
 
 def _conversion_output_dir(source_path: Path, config: Config | None) -> Path:
-    """Return the directory under conversions/ that mirrors the source file's location in raw/."""
+    """Return the directory under conversions/ that mirrors the source file's location."""
     if config is not None:
         try:
             rel = source_path.relative_to(config.raw_dir)
+            return config.conversions_dir / rel.parent / sanitize_filename(source_path.stem)
         except ValueError:
-            rel = Path(source_path.stem)
-        return config.conversions_dir / rel.parent / sanitize_filename(source_path.stem)
+            pass
+        for ext_src in config.external_sources:
+            try:
+                rel = source_path.relative_to(ext_src.path)
+                slug = _slugify(ext_src.name)
+                return (
+                    config.conversions_dir
+                    / "external"
+                    / slug
+                    / rel.parent
+                    / sanitize_filename(source_path.stem)
+                )
+            except ValueError:
+                continue
+        return config.conversions_dir / sanitize_filename(source_path.stem)
     # fallback when no config available (e.g. tests calling converters directly)
     return source_path.parent / sanitize_filename(source_path.stem)
 
@@ -1089,6 +1147,26 @@ def _cleanup_legacy_raw_conversion_dirs(config: Config) -> None:
                 pass
 
 
+def _copy_external_md(md_path: Path, config: Config) -> list[Path]:
+    """Copy an external .md file into conversions/external/ so it lives inside the vault."""
+    out_dir = _conversion_output_dir(md_path, config)
+    out_path = out_dir / "converted.md"
+    if out_path.exists() and not _should_rebuild_converted(md_path, out_path):
+        return [out_path]
+    try:
+        content = _read_text_with_fallback(md_path)
+    except Exception as e:
+        log.warning("Failed to read external markdown %s: %s", md_path.name, e)
+        return []
+    out_dir.mkdir(parents=True, exist_ok=True)
+    write_note(
+        out_path,
+        {"title": md_path.stem, "source_md": md_path.as_posix(), "tags": ["external-md"]},
+        content,
+    )
+    return [out_path]
+
+
 def collect_ingest_paths(config: Config, paths: list[Path] | None = None) -> list[Path]:
     """Collect markdown paths for ingest, auto-converting PDFs into grouped notes, and allowing arbitrary .md files as first-class input.
 
@@ -1168,6 +1246,46 @@ def collect_ingest_paths(config: Config, paths: list[Path] | None = None) -> lis
                 seen.add(key)
                 md_paths.append(path)
 
+    # Scan external sources (e.g. OneDrive/SharePoint sync folders)
+    if paths is None:
+        for ext_src in config.external_sources:
+            if not ext_src.path.exists():
+                log.warning("External source path does not exist, skipping: %s", ext_src.path)
+                continue
+            log.info("Scanning external source '%s': %s", ext_src.name, ext_src.path)
+            for path in sorted(ext_src.path.rglob("*")):
+                if not _is_ingest_candidate(path):
+                    continue
+                suffix = path.suffix.lower()
+                if suffix == ".pdf":
+                    output_dir = _conversion_output_dir(path, config)
+                    overwrite = _should_rebuild_pdf_groups(path, output_dir)
+                    for page_path in convert_pdf_to_markdown(path, overwrite=overwrite, config=config):
+                        key = page_path.resolve().as_posix()
+                        if key not in seen:
+                            seen.add(key)
+                            md_paths.append(page_path)
+                elif suffix in (".xlsx", ".docx", ".pptx", ".csv"):
+                    out_path = _conversion_output_dir(path, config) / "converted.md"
+                    overwrite = _should_rebuild_converted(path, out_path)
+                    converters = {
+                        ".xlsx": convert_xlsx_to_markdown,
+                        ".docx": convert_docx_to_markdown,
+                        ".pptx": convert_pptx_to_markdown,
+                        ".csv": convert_csv_to_markdown,
+                    }
+                    for converted in converters[suffix](path, overwrite=overwrite, config=config):
+                        key = converted.resolve().as_posix()
+                        if key not in seen:
+                            seen.add(key)
+                            md_paths.append(converted)
+                elif suffix == ".md":
+                    for converted in _copy_external_md(path, config):
+                        key = converted.resolve().as_posix()
+                        if key not in seen:
+                            seen.add(key)
+                            md_paths.append(converted)
+
     return sorted(md_paths)
 
 
@@ -1220,6 +1338,7 @@ def _create_source_summary_page(
     result: AnalysisResult,
     config: Config,
     body: str = "",
+    ext_src: ExternalSourceConfig | None = None,
 ) -> Path:
     """
     Generate wiki/sources/{Title}.md from AnalysisResult. No extra LLM call.
@@ -1265,10 +1384,11 @@ def _create_source_summary_page(
 
     concept_lines = "\n".join(f"- [[{target}]]" for target in merged_concepts)
 
+    tags = ["source"]
     out_meta: dict = {
         "title": title,
         "aliases": aliases,
-        "tags": ["source"],
+        "tags": tags,
         "status": "published",
         "source_file": rel_raw,
         "quality": result.quality,
@@ -1276,6 +1396,16 @@ def _create_source_summary_page(
     }
     if source_url:
         out_meta["source_url"] = source_url
+    if ext_src is not None:
+        out_meta["source"] = ext_src.source
+        out_meta["confidentiality"] = ext_src.confidentiality
+        if ext_src.service_line:
+            out_meta["service_line"] = ext_src.service_line
+        if result.client:
+            out_meta["client"] = result.client
+        if result.project:
+            out_meta["project"] = result.project
+        out_meta["tags"] = ["source", ext_src.source]
 
     body_parts = [
         f"# {title}",
@@ -1328,7 +1458,8 @@ def _ensure_source_summary_for_existing_ingest(
         quality=quality,
         language=record.language,
     )
-    _create_source_summary_page(path, src_meta, result, config, body=body)
+    ext_src = _find_external_source_for_path(path, config)
+    _create_source_summary_page(path, src_meta, result, config, body=body, ext_src=ext_src)
     log.info("Rebuilt missing source summary for already-ingested note: %s", path.name)
 
 
@@ -1517,6 +1648,8 @@ def ingest_note(
     except Exception:
         meta, body = {}, _read_text_with_fallback(path)
 
+    ext_src = _find_external_source_for_path(path, config)
+
     # Hash body only (strip frontmatter) so copies are detected as duplicates
     # even after ingest has updated the original's frontmatter (olw_status etc.).
     # Exception: when source_pdf is set (PDF-extracted pages), include it in the
@@ -1617,6 +1750,7 @@ def ingest_note(
             path_name=path.name,
             client=client,
             config=config,
+            extract_attribution=ext_src is not None,
         )
     except Exception as e:
         log.error("Analysis failed for %s: %s", path.name, e)
@@ -1669,7 +1803,7 @@ def ingest_note(
 
     # Create source summary page in wiki/sources/ (no extra LLM call)
     try:
-        _create_source_summary_page(path, meta, result, config, body=body)
+        _create_source_summary_page(path, meta, result, config, body=body, ext_src=ext_src)
     except Exception as e:
         log.warning("Source summary page failed for %s: %s", path.name, e)
 

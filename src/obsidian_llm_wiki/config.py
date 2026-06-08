@@ -140,6 +140,21 @@ class RagConfig(BaseModel):
     similarity_threshold: float = 0.7
 
 
+class ExternalSourceConfig(BaseModel):
+    """A source directory outside the vault (e.g. an OneDrive/SharePoint sync folder)."""
+
+    name: str
+    path: Path
+    service_line: str | None = None
+    source: str = "sharepoint"
+    confidentiality: str = "internal"
+
+    @field_validator("path", mode="before")
+    @classmethod
+    def expand_path(cls, v: str | Path) -> Path:
+        return Path(v).expanduser().resolve()
+
+
 class Config(BaseModel):
     vault: Path
     models: ModelsConfig = ModelsConfig()
@@ -147,6 +162,7 @@ class Config(BaseModel):
     provider: ProviderConfig | None = None  # supersedes [ollama] when present
     pipeline: PipelineConfig = PipelineConfig()
     rag: RagConfig = RagConfig()
+    external_sources: list[ExternalSourceConfig] = []
 
     @field_validator("vault", mode="before")
     @classmethod

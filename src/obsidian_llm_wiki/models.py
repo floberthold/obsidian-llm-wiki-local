@@ -55,6 +55,20 @@ class AnalysisResult(BaseModel):
         default=None,
         description="ISO 639-1 language code of the note (e.g. 'en', 'fr', 'de'). Null if uncertain.",  # noqa: E501
     )
+    client: str | None = Field(
+        default=None,
+        description=(
+            "Client organization name if clearly and explicitly stated in the document. "
+            "Return null if not evident — do not guess."
+        ),
+    )
+    project: str | None = Field(
+        default=None,
+        description=(
+            "Project name if clearly and explicitly stated in the document. "
+            "Return null if not evident — do not guess."
+        ),
+    )
 
 
 class ArticlePlan(BaseModel):

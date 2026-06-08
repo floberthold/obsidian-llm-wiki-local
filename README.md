@@ -50,6 +50,7 @@ The wiki lives in Obsidian, so you get the graph view, backlinks, and Dataview q
 - **Concept aliases** — aliases (e.g. `PC` for "Program Counter") are extracted at ingest, written to each article's frontmatter, and used to resolve queries and repair broken wikilinks (`olw maintain --fix` rewrites `[[PC]]` to `[[Program Counter|PC]]`)
 - **Multi-language** — automatically detects the language of each note at ingest time; articles are written in the detected language; override globally with `language = "en"` in `wiki.toml`
 - **Multi-provider** — swap Ollama for Groq, Together AI, LM Studio, vLLM, Azure OpenAI, or any OpenAI-compatible endpoint via `olw setup`
+- **External sources** — include SharePoint/OneDrive folders without copying files; auto-tags generated articles with `service_line`, `client`, and `project` inferred by the LLM
 - **Offline test suite** — all 418 tests run without Ollama or any provider
 
 ---
@@ -370,12 +371,17 @@ my-wiki/
 ├── raw/                        ← YOUR NOTES (never modified by olw)
 │   ├── quantum-computing.md
 │   └── ml-fundamentals.md
+├── conversions/                ← auto-generated conversion cache (never edit manually)
+│   ├── raw/                    ← converted PDFs, DOCX, XLSX from raw/
+│   └── external/               ← converted files from external sources (OneDrive, etc.)
+│       └── delivery-team/      ← one subfolder per [[external_sources]] entry
 ├── wiki/
 │   ├── Quantum Computing.md    ← concept articles (flat, one per concept)
 │   ├── Machine Learning.md
 │   ├── sources/                ← auto-generated source summaries
 │   │   ├── Quantum Computing Fundamentals.md
-│   │   └── ML Fundamentals.md
+│   │   ├── ML Fundamentals.md
+│   │   └── external/           ← source summaries for external-source files
 │   ├── queries/                ← saved Q&A answers (olw query --save)
 │   ├── .drafts/                ← pending human review
 │   ├── index.md                ← auto-generated navigation + routing layer
@@ -469,6 +475,113 @@ OLLAMA_NUM_PARALLEL=4 ollama serve
 This lets Ollama process multiple chunks simultaneously. On 16 GB VRAM with `gemma4:e4b` (9.6 GB), 4 parallel slots fit comfortably (~12.8 GB total). Wall time for a 25K-char note drops from ~39s to ~14s.
 
 After editing `wiki.toml`, no reinstall is needed. Run `olw compile --force` to regenerate articles with the new context budget.
+
+---
+
+## External sources (SharePoint / OneDrive)
+
+If your work documents live on SharePoint and are already synced to your laptop via OneDrive, you can include them in the wiki **without copying any files**. The pipeline reads them directly from their sync location and stores converted markdown inside the vault's `conversions/external/` cache.
+
+### Why not just copy files into `raw/`?
+
+SharePoint drives can contain hundreds of documents and are updated regularly. Keeping a copy in `raw/` means manual sync, wasted disk space, and stale data. External sources read the live OneDrive path on every run — no duplication needed.
+
+### Setup
+
+Add one `[[external_sources]]` block per SharePoint Team or OneDrive folder you want to include. Each entry is an explicit allowlist item — nothing is ingested unless you name it.
+
+```toml
+# wiki.toml
+
+[[external_sources]]
+name = "Delivery Team"
+path = "C:/Users/YourName/OneDrive - YourCompany/SharePoint/Delivery"
+service_line = "Delivery"
+
+[[external_sources]]
+name = "Sales Team"
+path = "C:/Users/YourName/OneDrive - YourCompany/SharePoint/Sales"
+service_line = "Sales"
+```
+
+| Field | Required | Description |
+|---|---|---|
+| `name` | ✓ | Logical name used for subfolder scoping — e.g. `"Delivery Team"` becomes `delivery-team` in paths |
+| `path` | ✓ | Absolute path to the OneDrive folder on disk. Forward slashes work on Windows. |
+| `service_line` | — | Tag injected into every source summary from this folder, e.g. `"Delivery"` |
+| `source` | — | Defaults to `"sharepoint"`. Change if your source is something else. |
+| `confidentiality` | — | Defaults to `"internal"`. Written into source summary frontmatter. |
+
+> **Windows path tip:** copy the path from Explorer's address bar and replace backslashes with forward slashes, or use double backslashes: `"C:\\Users\\..."`.
+
+### What gets picked up
+
+The pipeline processes every file type that `olw` already handles — **PDF, DOCX, XLSX, PPTX, CSV, and plain Markdown** — recursively from the configured path. Files are converted and cached under `conversions/external/<name-slug>/`. Nothing is written back to OneDrive.
+
+Files that are in the cloud but not yet synced (OneDrive placeholder icons) are silently skipped — OneDrive streams them on first access, so running the pipeline with a slow connection will trigger downloads.
+
+### Metadata tagging
+
+Source summaries generated from external files get extra frontmatter automatically:
+
+```yaml
+---
+title: Q3 Proposal Draft
+source: sharepoint
+service_line: Delivery
+confidentiality: internal
+client: AcmeCorp          # LLM-inferred — only set if clearly stated in the document
+project: Project Phoenix  # LLM-inferred — only set if clearly stated in the document
+tags: [source, sharepoint]
+---
+```
+
+`client` and `project` are extracted by the fast model during ingest. The prompt instructs the model to return these only when they are **explicitly named in the document** — if the document is a generic template or doesn't mention a client, both fields are left empty. No guessing.
+
+The extracted `client` and `project` values flow into the bundle scripts automatically (`wiki/projects/` bundles already scan source frontmatter for these fields).
+
+### Where the output lives
+
+```
+vault/
+├── conversions/
+│   └── external/
+│       └── delivery-team/          ← conversion cache, mirrors OneDrive structure
+│           ├── proposal-docx/
+│           │   └── converted.md
+│           └── report-pdf/
+│               ├── group-001-004.md
+│               └── group-005-008.md
+└── wiki/
+    └── sources/
+        └── external/
+            └── delivery-team/      ← source summaries with full metadata
+                ├── Q3 Proposal Draft.md
+                └── Annual Report.md
+```
+
+Compiled concept articles land in the main `wiki/` pool — they're concept-driven and shared across all sources, so a concept appearing in both `raw/` notes and a SharePoint proposal produces one article, not two.
+
+### Updating
+
+The pipeline detects when an OneDrive file has been modified (via mtime comparison) and re-converts it automatically on the next `olw run` or `olw ingest`. No manual cache-busting required.
+
+### Selective ingestion
+
+If you only want to include specific subfolders rather than a whole Team drive, point `path` at the subfolder directly:
+
+```toml
+[[external_sources]]
+name = "AcmeCorp Account"
+path = "C:/Users/YourName/OneDrive - YourCompany/Delivery/Clients/AcmeCorp"
+service_line = "Delivery"
+```
+
+You can have as many `[[external_sources]]` blocks as you need.
+
+### Future: Graph API
+
+When Graph API access becomes available, the same `[[external_sources]]` config can be extended with `graph_site_id` and `graph_drive_id` fields. The downstream ingest, LLM inference, and wiki generation remain identical — only the file-fetch step changes.
 
 ---
 
