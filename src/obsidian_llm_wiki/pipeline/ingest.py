@@ -505,7 +505,10 @@ def _write_pdf_group_source_mirror(group_path: Path, config: Config) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     title = src_meta.get("title") or group_path.stem.replace("-", " ").title()
-    first_para = next((line.strip() for line in body.splitlines() if line.strip()), "")
+    first_para = next(
+        (line.strip() for line in body.splitlines() if line.strip() and not line.strip().startswith("#")),
+        "",
+    )
     summary = first_para[:400] if first_para else "Grouped PDF extract."
     source_url = src_meta.get("source") or src_meta.get("url") or ""
     now = datetime.now().strftime("%Y-%m-%d")
@@ -527,6 +530,8 @@ def _write_pdf_group_source_mirror(group_path: Path, config: Config) -> None:
         "",
         "## Summary",
         summary,
+        "",
+        "## Concepts",
         "",
         "## Source Info",
         "- **Quality:** medium",
